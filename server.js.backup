@@ -1,0 +1,3338 @@
+const express = require("express");
+const http = require("http");
+const socketIo = require("socket.io");
+const { v4: uuidv4 } = require("uuid");
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"],
+    },
+});
+
+function inferWeaponKeyFromClass(className) {
+    switch (className) {
+        case "healer":
+            return "healerStaff";
+        case "mage":
+            return "mageBolt";
+        case "ranged":
+            return "arrow";
+        case "melee":
+            return "meleeStrike";
+        default:
+            return "pistol";
+    }
+}
+
+// Normalize weapon stats for server-side projectile simulation
+function normalizeWeapon(weaponKey, weaponObj, className) {
+    const defaults = {
+        pistol: {
+            damage: 20,
+            fireRate: 170,
+            projectileSpeed: 800,
+            projectileSize: 15,
+            projectileLifetime: 2.0,
+        },
+        rifle: {
+            damage: 28,
+            fireRate: 70,
+            projectileSpeed: 1000,
+            projectileSize: 12,
+            projectileLifetime: 2.5,
+        },
+        shotgun: {
+            damage: 15,
+            fireRate: 400,
+            projectileSpeed: 500,
+            projectileSize: 8,
+            projectileLifetime: 1.5,
+        },
+        sniper: {
+            damage: 100,
+            fireRate: 800,
+            projectileSpeed: 1200,
+            projectileSize: 10,
+            projectileLifetime: 3.0,
+        },
+        explosive: {
+            damage: 50,
+            fireRate: 600,
+            projectileSpeed: 420,
+            projectileSize: 20,
+            projectileLifetime: 4.0,
+        },
+        laser: {
+            damage: 40,
+            fireRate: 40,
+            projectileSpeed: 1600,
+            projectileSize: 6,
+            projectileLifetime: 1.0,
+        },
+        plasma: {
+            damage: 60,
+            fireRate: 600,
+            projectileSpeed: 350,
+            projectileSize: 18,
+            projectileLifetime: 3.5,
+        },
+        minigun: {
+            damage: 14,
+            fireRate: 25,
+            projectileSpeed: 900,
+            projectileSize: 8,
+            projectileLifetime: 2.0,
+        },
+        healerStaff: {
+            damage: 25,
+            fireRate: 350,
+            projectileSpeed: 500,
+            projectileSize: 12,
+            projectileLifetime: 2.0,
+        },
+        mageBolt: {
+            damage: 22,
+            fireRate: 220,
+            projectileSpeed: 900,
+            projectileSize: 10,
+            projectileLifetime: 2.0,
+        },
+        arrow: {
+            damage: 40,
+            fireRate: 250,
+            projectileSpeed: 1400,
+            projectileSize: 4,
+            projectileLifetime: 2.2,
+        },
+        meleeStrike: {
+            damage: 45,
+            fireRate: 350,
+            projectileSpeed: 1200,
+            projectileSize: 24,
+            projectileLifetime: 0.2,
+        },
+    };
+    const fallbackKey = weaponKey || inferWeaponKeyFromClass(className);
+    const base = defaults[fallbackKey] || defaults.pistol;
+    const w = weaponObj && typeof weaponObj === "object" ? weaponObj : {};
+    return {
+        damage: Number(w.damage) || base.damage,
+        fireRate: Number(w.fireRate) || base.fireRate,
+        projectileSpeed: Number(w.projectileSpeed) || base.projectileSpeed,
+        projectileSize: Number(w.projectileSize) || base.projectileSize,
+        // client sends ms sometimes; accept seconds number otherwise
+        projectileLifetime: typeof w.projectileLifetime === "number" && w.projectileLifetime > 50 ?
+            w.projectileLifetime / 1000 : Number(w.projectileLifetime) || base.projectileLifetime,
+    };
+}
+
+// Serve static files
+app.use(express.static("public"));
+// Serve socket.io client for browsers
+app.get("/socket.io/socket.io.js", (req, res) => {
+    try {
+        const clientPath = require.resolve("socket.io/client-dist/socket.io.js");
+        res.sendFile(clientPath);
+    } catch (e) {
+        res.status(404).end();
+    }
+});
+
+// Game state
+const lobbies = new Map();
+const players = new Map();
+
+// Lobby class
+class Lobby {
+    constructor(name, hostId) {
+        this.id = uuidv4();
+        this.name = name;
+        this.hostId = hostId;
+        this.players = new Map();
+        this.maxPlayers = 4;
+        this.gameState = "waiting"; // waiting, playing, finished
+        this.gameStartTime = null;
+        this.gameTimer = null;
+        this.gameDuration = 900000; // 15 minutes in milliseconds (will be adjusted per game mode)
+        this.gameMode = "survival"; // survival, deathmatch
+        // NPC for testing
+        this.npc = null;
+        this.npcInterval = null;
+        this.npcLastTime = null;
+        this.npcShootLast = null;
+        this.simProjectiles = new Map();
+        this.clientPaused = false;
+        // Persistent area effects
+        this.areaEffects = new Map();
+    }
+
+    addPlayer(playerId, playerName) {
+        if (this.players.size >= this.maxPlayers) return false;
+        // Duplicate name check (case-insensitive) within lobby
+        for (const p of this.players.values()) {
+            if (typeof p.name === "string" && typeof playerName === "string") {
+                if (p.name.trim().toLowerCase() === playerName.trim().toLowerCase()) {
+                    return { error: "Name already taken in this lobby" };
+                }
+            }
+        }
+
+        const player = {
+            id: playerId,
+            name: playerName,
+            x: Math.random() * 600 + 100, // Spawn within 800x600 area (100-700)
+            y: Math.random() * 400 + 100, // Spawn within 800x600 area (100-500)
+            health: 100,
+            score: 0,
+            kills: 0,
+            deaths: 0,
+            lives: 3,
+            isDead: false,
+            respawnTime: 0,
+            lastShot: 0,
+            chosenClass: null,
+        };
+
+        this.players.set(playerId, player);
+        return true;
+    }
+
+    removePlayer(playerId) {
+        this.players.delete(playerId);
+        if (this.players.size === 0) {
+            this.gameState = "waiting";
+            this.gameStartTime = null;
+        } else if (this.gameState === "playing" && this.gameMode === "deathmatch") {
+            // Check if deathmatch should end when a player leaves during gameplay
+            this.checkDeathmatchEnd();
+        }
+    }
+
+    setGameMode(gameMode) {
+        if (["survival", "deathmatch"].includes(gameMode)) {
+            this.gameMode = gameMode;
+            return true;
+        }
+        return false;
+    }
+
+    startGame() {
+        if (this.players.size < 2) return false;
+        for (const p of this.players.values()) {
+            if (!p.chosenClass) return false;
+        }
+
+        this.gameState = "playing";
+        this.gameStartTime = Date.now();
+
+        // Set game duration based on game mode
+        if (this.gameMode === "survival") {
+            this.gameDuration = 900000; // 15 minutes for survival
+        } else {
+            this.gameDuration = 300000; // 5 minutes for deathmatch
+        }
+
+        // Reset player positions and stats
+        this.players.forEach((player, playerId) => {
+            player.x = Math.random() * 600 + 100; // Spawn within 800x600 area (100-700)
+            player.y = Math.random() * 400 + 100; // Spawn within 800x600 area (100-500)
+            player.health = 100;
+            player.score = 0;
+            player.kills = 0;
+            player.deaths = 0;
+        });
+
+        // Always initialize walls for collision detection
+        this.initializeWalls();
+
+        // Initialize wave-based zombie system only for survival mode
+        if (this.gameMode === "survival") {
+            this.initializeWaves();
+        } else {
+            // For deathmatch mode, set up projectile update loop
+            this.lastUpdate = Date.now();
+            this.waveInterval = setInterval(() => this.updateWaveLoop(), 50);
+        }
+
+        // Start game timer
+        this.gameTimer = setTimeout(() => {
+            this.endGame();
+        }, this.gameDuration);
+
+        return true;
+    }
+
+    endGame() {
+        this.gameState = "finished";
+        this.gameStartTime = null;
+
+        // Stop zombie logic only for survival mode
+        if (this.gameMode === "survival") {
+            if (this.waveInterval) {
+                clearInterval(this.waveInterval);
+                this.waveInterval = null;
+            }
+            if (this.waveCountdownTimeout) {
+                clearTimeout(this.waveCountdownTimeout);
+                this.waveCountdownTimeout = null;
+            }
+            // Clear zombie data
+            this.zombies = new Map();
+        }
+
+        // Clear other game data
+        this.simProjectiles = new Map();
+        this.areaEffects = new Map();
+
+        // Reset player states but keep them in lobby
+        this.players.forEach((player, playerId) => {
+            player.health = 100;
+            player.score = 0;
+            player.kills = 0;
+            player.deaths = 0;
+            player.lives = 3;
+            player.isDead = false;
+            player.respawnTime = 0;
+            player.lastShot = 0;
+            player.meleeCharge = 0;
+            player.isInvulnerable = false;
+            player.slowUntil = 0;
+            player.abilityCooldowns = {};
+        });
+
+        // Find winner
+        let winner = null;
+        let highestScore = -1;
+
+        this.players.forEach((player) => {
+            if (player.score > highestScore) {
+                highestScore = player.score;
+                winner = {
+                    id: player.id,
+                    name: player.name,
+                    score: player.score,
+                    kills: player.kills,
+                    deaths: player.deaths
+                };
+            }
+        });
+
+        // Emit game end to all players in lobby
+        io.to(this.id).emit("gameEnd", { winner });
+
+        // Reset game state after delay
+        setTimeout(() => {
+            this.gameState = "waiting";
+            this.gameStartTime = null;
+
+            // Emit updated lobby state
+            io.to(this.id).emit("lobbyUpdate", {
+                players: Array.from(this.players.values()),
+                gameState: this.gameState,
+                gameStartTime: this.gameStartTime,
+                gameMode: this.gameMode,
+            });
+        }, 5000);
+    }
+
+    // Initialize walls for collision detection (used by both game modes)
+    initializeWalls() {
+        this.worldW = 1200;
+        this.worldH = 800;
+        // Mirror client's interior walls for server-side collision
+        const W = this.worldW;
+        const H = this.worldH;
+        const wallThickness = Math.max(16, Math.floor(Math.min(W, H) * 0.015));
+        this.walls = [{
+                x: Math.floor(W * 0.18),
+                y: Math.floor(H * 0.22),
+                w: Math.floor(W * 0.24),
+                h: wallThickness,
+            },
+            {
+                x: Math.floor(W * 0.62),
+                y: Math.floor(H * 0.38),
+                w: wallThickness,
+                h: Math.floor(H * 0.26),
+            },
+            {
+                x: Math.floor(W * 0.25),
+                y: Math.floor(H * 0.72),
+                w: Math.floor(W * 0.3),
+                h: wallThickness,
+            },
+        ];
+    }
+
+    // Wave/zombie system
+    initializeWaves() {
+        this.waveNumber = 0;
+        this.zombies = new Map();
+        this.waveInProgress = false;
+
+        // Multiple spawn locations around the map edges
+        this.spawners = [
+            { x: this.worldW - 80, y: 80 }, // Top-right
+            { x: this.worldW - 80, y: this.worldH - 80 }, // Bottom-right
+            { x: 80, y: 80 }, // Top-left
+            { x: 80, y: this.worldH - 80 }, // Bottom-left
+            { x: this.worldW / 2, y: 80 }, // Top-center
+            { x: this.worldW / 2, y: this.worldH - 80 } // Bottom-center
+        ];
+
+        if (this.waveInterval) clearInterval(this.waveInterval);
+        this.lastUpdate = Date.now();
+        this.zombieBroadcastAccum = 0;
+        this.waveInterval = setInterval(() => this.updateWaveLoop(), 50);
+        this.startNextWaveWithCountdown(0);
+    }
+
+    startNextWaveWithCountdown(delayMs) {
+        const baseDelay = typeof delayMs === "number" ? delayMs : 3000;
+        this.waveInProgress = false;
+        this.waveNumber += 1;
+        io.to(this.id).emit("waveOver", {
+            nextInMs: baseDelay,
+            nextWave: this.waveNumber,
+        });
+        if (this.waveCountdownTimeout) clearTimeout(this.waveCountdownTimeout);
+        this.waveCountdownTimeout = setTimeout(() => {
+            this.spawnWave(this.waveNumber);
+            this.waveInProgress = true;
+            io.to(this.id).emit("waveStarted", { wave: this.waveNumber });
+        }, baseDelay);
+    }
+
+    spawnWave(wave) {
+        const totalCount = Math.min(50, 3 + wave * 2);
+
+        // Initialize wave spawning state
+        this.currentWaveZombies = 0;
+        this.totalWaveZombies = totalCount;
+        this.lastZombieSpawn = Date.now();
+
+        // Calculate spawn interval (gets faster with higher waves)
+        // Wave 1: 2 seconds, Wave 2: 1.5 seconds, Wave 3+: 1 second minimum
+        this.zombieSpawnInterval = Math.max(1000, 2500 - wave * 250);
+
+        console.log(
+            `Wave ${wave}: Spawning ${totalCount} zombies over time (${this.zombieSpawnInterval}ms intervals)`
+        );
+    }
+
+    spawnSingleZombie() {
+        const id = `z-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+
+        // Randomly select a spawn location
+        const spawner = this.spawners[Math.floor(Math.random() * this.spawners.length)];
+
+        // Determine NPC type based on wave and random chance
+        let npcType = "zombie"; // Default type
+
+        if (this.waveNumber >= 3) {
+            // After wave 3, introduce fast mobs
+            if (Math.random() < 0.3) {
+                npcType = "fastMob";
+            }
+        }
+
+        if (this.waveNumber >= 5) {
+            // After wave 5, introduce boss mobs (rare)
+            if (Math.random() < 0.1) {
+                npcType = "bossMob";
+            }
+        }
+
+        let zombie;
+
+        switch (npcType) {
+            case "fastMob":
+                zombie = {
+                    id,
+                    type: "fastMob",
+                    x: spawner.x + Math.random() * 30,
+                    y: spawner.y + Math.random() * 30,
+                    vx: 0,
+                    vy: 0,
+                    speed: 180 + Math.random() * 60, // 3x speed (was 60 + 20)
+                    size: 28, // Smaller
+                    health: 80,
+                    maxHealth: 80,
+                    lastAttack: 0,
+                    attackCooldown: 800, // Slightly slower attacks
+                    damage: 8, // Lower damage
+                    knockback: 780, // 3x normal knockback
+                    lastEvasion: 0,
+                    evasionCooldown: 2000, // Evade every 2 seconds
+                    lastSpecialAttack: 0,
+                    specialAttackCooldown: 3000, // Special attack every 3 seconds
+                    // Wall-following properties
+                    isFollowingWall: false,
+                    wallFollowDirection: null,
+                    lastWallCollision: 0,
+                    initialWallFollowX: 0,
+                    initialWallFollowY: 0,
+                    wallFollowDistance: 0,
+                    wallFollowEndTime: 0,
+                    wallFollowStartTime: 0,
+                    lastProgressTime: 0,
+                    lastProgressDistance: 0,
+                    followingWallId: null,
+                    collisionWall: null,
+                    cornerDetectionDistance: 0
+                };
+                break;
+
+            case "bossMob":
+                zombie = {
+                    id,
+                    type: "bossMob",
+                    x: spawner.x + Math.random() * 30,
+                    y: spawner.y + Math.random() * 30,
+                    vx: 0,
+                    vy: 0,
+                    speed: 25 + Math.random() * 10, // Slower but steady
+                    size: 60, // Much larger
+                    health: 1200, // 3x health (was 400)
+                    maxHealth: 1200, // 3x max health (was 400)
+                    lastAttack: 0,
+                    attackCooldown: 1000, // Slower attacks
+                    damage: 25, // Higher damage
+                    knockback: 400, // Higher knockback
+                    lastSpecialAttack: 0,
+                    specialAttackCooldown: 3000, // Special attack every 3 seconds
+                    lastProjectileAttack: 0,
+                    projectileAttackCooldown: 2000, // Projectile attack every 2 seconds
+                    specialAbilities: ["slow", "heal", "ranged", "meleeSlam"], // Available abilities
+                    // Wall-following properties
+                    isFollowingWall: false,
+                    wallFollowDirection: null,
+                    lastWallCollision: 0,
+                    initialWallFollowX: 0,
+                    initialWallFollowY: 0,
+                    wallFollowDistance: 0,
+                    wallFollowEndTime: 0,
+                    wallFollowStartTime: 0,
+                    lastProgressTime: 0,
+                    lastProgressDistance: 0,
+                    followingWallId: null,
+                    collisionWall: null,
+                    cornerDetectionDistance: 0
+                };
+                break;
+
+            default: // Regular zombie
+                zombie = {
+                    id,
+                    type: "zombie",
+                    x: spawner.x + Math.random() * 30,
+                    y: spawner.y + Math.random() * 30,
+                    vx: 0,
+                    vy: 0,
+                    speed: 30 + Math.random() * 10,
+                    size: 36,
+                    health: 120,
+                    maxHealth: 120,
+                    lastAttack: 0,
+                    attackCooldown: 600, // ms
+                    damage: 12,
+                    knockback: 260,
+                    // Wall-following properties
+                    isFollowingWall: false,
+                    wallFollowDirection: null,
+                    lastWallCollision: 0,
+                    initialWallFollowX: 0,
+                    initialWallFollowY: 0,
+                    wallFollowDistance: 0,
+                    wallFollowEndTime: 0,
+                    wallFollowStartTime: 0,
+                    lastProgressTime: 0,
+                    lastProgressDistance: 0,
+                    followingWallId: null,
+                    collisionWall: null,
+                    cornerDetectionDistance: 0
+                };
+                break;
+        }
+
+        this.zombies.set(id, zombie);
+        this.currentWaveZombies++;
+    }
+
+    updateWaveLoop() {
+        const now = Date.now();
+        if (this.clientPaused) {
+            this.lastUpdate = now;
+            return;
+        }
+
+        const dt = Math.max(0.001, (now - (this.lastUpdate || now)) / 1000);
+        this.lastUpdate = now;
+
+        // Skip zombie logic for deathmatch mode
+        if (this.gameMode === "deathmatch") {
+            // Still update area effects and projectiles for deathmatch
+            this.updateAreaEffects(now, dt);
+            this.updateProjectiles(dt);
+            this.updatePlayerStates(dt);
+            return;
+        }
+
+        // Handle gradual zombie spawning during active wave
+        if (
+            this.waveInProgress &&
+            this.currentWaveZombies < this.totalWaveZombies &&
+            now - this.lastZombieSpawn >= this.zombieSpawnInterval
+        ) {
+            this.spawnSingleZombie();
+            this.lastZombieSpawn = now;
+        }
+
+        // Update area effects
+        this.updateAreaEffects(now, dt);
+
+        // Update zombies: seek nearest player
+        this.zombies.forEach((z) => {
+            let nearest = null;
+            let nearestD2 = Infinity;
+            this.players.forEach((p, pid) => {
+                const dx = p.x - z.x;
+                const dy = p.y - z.y;
+                const d2 = dx * dx + dy * dy;
+                if (d2 < nearestD2) {
+                    nearestD2 = d2;
+                    nearest = p;
+                }
+            });
+            if (nearest) {
+                const dx = nearest.x - z.x;
+                const dy = nearest.y - z.y;
+                const dist = Math.max(0.001, Math.sqrt(dx * dx + dy * dy));
+                const nx = dx / dist;
+                const ny = dy / dist;
+
+                // Check if zombie is stunned from knockback
+                const isStunned = z.stunnedUntil && typeof z.stunnedUntil === "number" && now < z.stunnedUntil;
+
+                // Apply slow effect if present (more robust check)
+                const isSlowed =
+                    z.slowUntil && typeof z.slowUntil === "number" && now < z.slowUntil;
+                const slowFactor = isSlowed ? 0.2 : 1.0; // More dramatic slow effect
+
+                // Debug logging for slow effect (remove after testing)
+                if (isSlowed && Math.random() < 0.01) {
+                    // Log 1% of the time when slowed
+                    console.log(
+                        `Zombie ${z.id} is slowed: factor=${slowFactor}, slowUntil=${z.slowUntil}, now=${now}`
+                    );
+                }
+
+                // Handle different NPC types
+                if (z.type === "fastMob") {
+                    this.updateFastMob(z, nearest, nx, ny, dist, now, slowFactor, dt);
+                } else if (z.type === "bossMob") {
+                    console.log(`Updating boss mob ${z.id} at position (${z.x.toFixed(1)}, ${z.y.toFixed(1)}) with target at distance ${dist.toFixed(1)}`);
+                    this.updateBossMob(z, nearest, nx, ny, dist, now, slowFactor, dt);
+                } else {
+                    // Regular zombie behavior
+                    this.updateRegularZombie(z, nearest, nx, ny, dist, now, slowFactor, dt);
+                }
+            }
+        });
+
+        // Update simulated projectiles
+        this.updateProjectiles(dt);
+
+        // Broadcast zombies state at 20 FPS for smooth movement (only for survival mode)
+        if (this.gameMode === "survival") {
+            this.zombieBroadcastAccum += dt;
+            if (this.zombieBroadcastAccum >= 0.05) {
+                // 20 FPS for zombie updates
+                this.zombieBroadcastAccum = 0;
+                io.to(this.id).emit("zombiesState", {
+                    zombies: Array.from(this.zombies.values()),
+                });
+            }
+        }
+
+        // Broadcast player states at 10 FPS for scoreboard updates
+        this.updatePlayerStates(dt);
+
+        // Wave completion check - all zombies spawned AND all zombies eliminated (only for survival mode)
+        if (
+            this.gameMode === "survival" &&
+            this.waveInProgress &&
+            this.zombies.size === 0 &&
+            this.currentWaveZombies >= this.totalWaveZombies
+        ) {
+            this.startNextWaveWithCountdown(3000);
+        }
+    }
+
+    updateRegularZombie(z, nearest, nx, ny, dist, now, slowFactor, dt) {
+        // Check if zombie is stunned from knockback
+        const isStunned = z.stunnedUntil && typeof z.stunnedUntil === "number" && now < z.stunnedUntil;
+
+        // If stunned, don't move towards player, just apply knockback physics
+        if (isStunned) {
+            // Apply knockback physics (gravity-like effect to slow down)
+            z.vx *= 0.95; // Gradually reduce knockback velocity
+            z.vy *= 0.95;
+        } else {
+            // Try wall-following first if we're stuck
+            if (z.isFollowingWall) {
+                const stillFollowing = this.updateWallFollowingMovement(z, nearest, nx, ny, slowFactor);
+                if (stillFollowing) {
+                    // Still wall-following, skip normal movement
+                } else {
+                    // Wall-following ended, add a small delay before normal movement
+                    // This prevents sudden direction changes that can make zombies appear to move away
+                    const wallFollowEndDelay = 200; // 200ms delay
+                    if (now - (z.wallFollowEndTime || 0) < wallFollowEndDelay) {
+                        // Still in delay period, gradually transition to normal movement
+                        const transitionProgress = (now - (z.wallFollowEndTime || 0)) / wallFollowEndDelay;
+                        const currentSpeed = z.speed * slowFactor * transitionProgress;
+                        z.vx = nx * currentSpeed;
+                        z.vy = ny * currentSpeed;
+                    } else {
+                        // Delay period ended, use normal movement
+                        z.vx = nx * z.speed * slowFactor;
+                        z.vy = ny * z.speed * slowFactor;
+                    }
+                }
+            } else {
+                // Normal movement towards player
+                z.vx = nx * z.speed * slowFactor;
+                z.vy = ny * z.speed * slowFactor;
+            }
+        }
+
+        // Store old position for collision rollback
+        const oldX = z.x;
+        const oldY = z.y;
+
+        // Update position
+        z.x += z.vx * dt;
+        z.y += z.vy * dt;
+
+        // Check wall collisions and resolve
+        this.resolveZombieWallCollisions(z, oldX, oldY, nearest);
+
+        // Melee hit
+        const meleeRange = (z.size || 36) * 0.7 + 20;
+        if (
+            dist <= meleeRange &&
+            now - (z.lastAttack || 0) >= z.attackCooldown
+        ) {
+            z.lastAttack = now;
+            // Apply knockback + damage
+            const kx = nx * z.knockback;
+            const ky = ny * z.knockback;
+            io.to(this.id).emit("applyKnockback", {
+                playerId: nearest.id || nearest,
+                vx: kx,
+                vy: ky,
+            });
+            nearest.health = Math.max(0, nearest.health - z.damage);
+            console.log(
+                `Server: Sending playerHit event for zombie melee attack on player ${
+      nearest.id || nearest
+    }, new health: ${nearest.health}`
+            ); // Debug log
+            io.to(this.id).emit("playerHit", {
+                shooterId: "zombie",
+                targetId: nearest.id || nearest,
+                newHealth: nearest.health,
+                damage: z.damage,
+            });
+
+            // Check for death
+            if (nearest.health <= 0) {
+                console.log(
+                    `Server: Player ${
+      nearest.id || nearest
+    } health reached 0 from zombie melee, calling handlePlayerDeath`
+                ); // Debug log
+                this.handlePlayerDeath(nearest.id || nearest);
+            }
+        }
+    }
+
+    updateFastMob(z, nearest, nx, ny, dist, now, slowFactor, dt) {
+        // Fast mob behavior: move towards player but try to evade attacks
+        const isStunned = z.stunnedUntil && typeof z.stunnedUntil === "number" && now < z.stunnedUntil;
+
+        if (isStunned) {
+            // Apply knockback physics
+            z.vx *= 0.95;
+            z.vy *= 0.95;
+        } else {
+            // Check for wall-following first if we're stuck
+            if (z.isFollowingWall) {
+                const stillFollowing = this.updateWallFollowingMovement(z, nearest, nx, ny, slowFactor);
+                if (stillFollowing) {
+                    // Still wall-following, skip normal movement
+                } else {
+                    // Wall-following ended, add a small delay before normal movement
+                    // This prevents sudden direction changes that can make zombies appear to move away
+                    const wallFollowEndDelay = 200; // 200ms delay
+                    if (now - (z.wallFollowEndTime || 0) < wallFollowEndDelay) {
+                        // Still in delay period, gradually transition to normal movement
+                        const transitionProgress = (now - (z.wallFollowEndTime || 0)) / wallFollowEndDelay;
+                        const currentSpeed = z.speed * slowFactor * transitionProgress;
+                        z.vx = nx * currentSpeed;
+                        z.vy = ny * currentSpeed;
+                        return; // Skip the rest of the movement logic during transition
+                    }
+                    // Delay period ended, use normal fast mob logic
+                    // Check for nearby projectiles to dodge
+                    let shouldDodge = false;
+                    let dodgeDirection = { x: 0, y: 0 };
+
+                    if (this.simProjectiles) {
+                        this.simProjectiles.forEach((projectile) => {
+                            if (projectile.ownerId !== z.id) { // Don't dodge own projectiles
+                                const dx = projectile.x - z.x;
+                                const dy = projectile.y - z.y;
+                                const projectileDist = Math.sqrt(dx * dx + dy * dy);
+
+                                // Dodge if projectile is within 100 pixels and heading towards us
+                                if (projectileDist < 100) {
+                                    const projSpeed = Math.sqrt(projectile.vx * projectile.vx + projectile.vy * projectile.vy);
+                                    if (projSpeed > 0) {
+                                        const projDirX = projectile.vx / projSpeed;
+                                        const projDirY = projectile.vy / projSpeed;
+
+                                        // Calculate if projectile is heading towards zombie
+                                        const dotProduct = dx * projDirX + dy * projDirY;
+                                        if (dotProduct > 0) { // Projectile heading towards zombie
+                                            shouldDodge = true;
+                                            // Dodge perpendicular to projectile direction
+                                            dodgeDirection.x = -projDirY;
+                                            dodgeDirection.y = projDirX;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    if (shouldDodge) {
+                        // Emergency dodge - move perpendicular to projectile direction
+                        const dodgeSpeed = z.speed * 1.6 * slowFactor; // Faster dodge
+                        z.vx = dodgeDirection.x * dodgeSpeed;
+                        z.vy = dodgeDirection.y * dodgeSpeed;
+                        z.lastEvasion = now; // Reset evasion timer
+                    } else {
+                        // Enhanced evasion system with weaving and dodging
+                        const timeSinceEvasion = now - (z.lastEvasion || 0);
+                        const evasionPhase = (timeSinceEvasion % 1000) / 1000; // 0 to 1 over 1 second
+
+                        if (timeSinceEvasion >= z.evasionCooldown) {
+                            // Major evasion - move perpendicular to player direction
+                            const evadeX = -ny * z.speed * 0.8 * slowFactor;
+                            const evadeY = nx * z.speed * 0.8 * slowFactor;
+                            z.vx = evadeX;
+                            z.vy = evadeY;
+                            z.lastEvasion = now;
+                        } else if (timeSinceEvasion >= 200) { // Start weaving after 200ms
+                            // Weaving pattern: sine wave perpendicular to movement direction
+                            const weaveIntensity = 3 * slowFactor; // 2x bigger weaving (was 0.6)
+                            const weaveFrequency = 2; // 2x slower weaving (was 8)
+
+                            // Base movement towards player
+                            const baseSpeed = z.speed * 0.7 * slowFactor;
+                            const baseVx = nx * baseSpeed;
+                            const baseVy = ny * baseSpeed;
+
+                            // Add weaving motion perpendicular to player direction
+                            const weaveX = -ny * baseSpeed * weaveIntensity * Math.sin(evasionPhase * weaveFrequency * Math.PI * 2);
+                            const weaveY = nx * baseSpeed * weaveIntensity * Math.sin(evasionPhase * weaveFrequency * Math.PI * 2);
+
+                            z.vx = baseVx + weaveX;
+                            z.vy = baseVy + weaveY;
+                        } else {
+                            // Initial approach - move directly towards player
+                            z.vx = nx * z.speed * slowFactor;
+                            z.vy = ny * z.speed * slowFactor;
+                        }
+                    }
+                }
+            } else {
+                // Normal fast mob behavior (no wall-following)
+                // Check for nearby projectiles to dodge
+                let shouldDodge = false;
+                let dodgeDirection = { x: 0, y: 0 };
+
+                if (this.simProjectiles) {
+                    this.simProjectiles.forEach((projectile) => {
+                        if (projectile.ownerId !== z.id) { // Don't dodge own projectiles
+                            const dx = projectile.x - z.x;
+                            const dy = projectile.y - z.y;
+                            const projectileDist = Math.sqrt(dx * dx + dy * dy);
+
+                            // Dodge if projectile is within 100 pixels and heading towards us
+                            if (projectileDist < 100) {
+                                const projSpeed = Math.sqrt(projectile.vx * projectile.vx + projectile.vy * projectile.vy);
+                                if (projSpeed > 0) {
+                                    const projDirX = projectile.vx / projSpeed;
+                                    const projDirY = projectile.vy / projSpeed;
+
+                                    // Calculate if projectile is heading towards zombie
+                                    const dotProduct = dx * projDirX + dy * projDirY;
+                                    if (dotProduct > 0) { // Projectile heading towards zombie
+                                        shouldDodge = true;
+                                        // Dodge perpendicular to projectile direction
+                                        dodgeDirection.x = -projDirY;
+                                        dodgeDirection.y = projDirX;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+
+                if (shouldDodge) {
+                    // Emergency dodge - move perpendicular to projectile direction
+                    const dodgeSpeed = z.speed * 1.6 * slowFactor; // Faster dodge
+                    z.vx = dodgeDirection.x * dodgeSpeed;
+                    z.vy = dodgeDirection.y * dodgeSpeed;
+                    z.lastEvasion = now; // Reset evasion timer
+                } else {
+                    // Enhanced evasion system with weaving and dodging
+                    const timeSinceEvasion = now - (z.lastEvasion || 0);
+                    const evasionPhase = (timeSinceEvasion % 1000) / 1000; // 0 to 1 over 1 second
+
+                    if (timeSinceEvasion >= z.evasionCooldown) {
+                        // Major evasion - move perpendicular to player direction
+                        const evadeX = -ny * z.speed * 0.8 * slowFactor;
+                        const evadeY = nx * z.speed * 0.8 * slowFactor;
+                        z.vx = evadeX;
+                        z.vy = evadeY;
+                        z.lastEvasion = now;
+                    } else if (timeSinceEvasion >= 200) { // Start weaving after 200ms
+                        // Weaving pattern: sine wave perpendicular to movement direction
+                        const weaveIntensity = 3 * slowFactor; // 2x bigger weaving (was 0.6)
+                        const weaveFrequency = 2; // 2x slower weaving (was 8)
+
+                        // Base movement towards player
+                        const baseSpeed = z.speed * 0.7 * slowFactor;
+                        const baseVx = nx * baseSpeed;
+                        const baseVy = ny * baseSpeed;
+
+                        // Add weaving motion perpendicular to player direction
+                        const weaveX = -ny * baseSpeed * weaveIntensity * Math.sin(evasionPhase * weaveFrequency * Math.PI * 2);
+                        const weaveY = nx * baseSpeed * weaveIntensity * Math.sin(evasionPhase * weaveFrequency * Math.PI * 2);
+
+                        z.vx = baseVx + weaveX;
+                        z.vy = baseVy + weaveY;
+                    } else {
+                        // Initial approach - move directly towards player
+                        z.vx = nx * z.speed * slowFactor;
+                        z.vy = ny * z.speed * slowFactor;
+                    }
+                }
+            }
+        }
+
+        // Store old position for collision rollback
+        const oldX = z.x;
+        const oldY = z.y;
+
+        // Update position
+        z.x += z.vx * dt;
+        z.y += z.vy * dt;
+
+        // Check wall collisions and resolve
+        this.resolveZombieWallCollisions(z, oldX, oldY, nearest);
+
+        // Melee hit with enhanced knockback
+        const meleeRange = (z.size || 28) * 0.7 + 20;
+        if (
+            dist <= meleeRange &&
+            now - (z.lastAttack || 0) >= z.attackCooldown
+        ) {
+            z.lastAttack = now;
+            // Apply enhanced knockback + damage
+            const kx = nx * z.knockback;
+            const ky = ny * z.knockback;
+            io.to(this.id).emit("applyKnockback", {
+                playerId: nearest.id || nearest,
+                vx: kx,
+                vy: ky,
+            });
+            nearest.health = Math.max(0, nearest.health - z.damage);
+            console.log(
+                `Server: Sending playerHit event for fast mob melee attack on player ${
+      nearest.id || nearest
+    }, new health: ${nearest.health}`
+            );
+            io.to(this.id).emit("playerHit", {
+                shooterId: "fastMob",
+                targetId: nearest.id || nearest,
+                newHealth: nearest.health,
+                damage: z.damage,
+            });
+
+            // Check for death
+            if (nearest.health <= 0) {
+                console.log(
+                    `Server: Player ${
+      nearest.id || nearest
+    } health reached 0 from fast mob melee, calling handlePlayerDeath`
+                );
+                this.handlePlayerDeath(nearest.id || nearest);
+            }
+        }
+    }
+
+    updateBossMob(z, nearest, nx, ny, dist, now, slowFactor, dt) {
+        // Boss mob behavior: strategic movement and special abilities
+        const isStunned = z.stunnedUntil && typeof z.stunnedUntil === "number" && now < z.stunnedUntil;
+
+        if (isStunned) {
+            console.log(`Boss mob ${z.id} is stunned until ${z.stunnedUntil}, now: ${now}`);
+            // Apply knockback physics
+            z.vx *= 0.95;
+            z.vy *= 0.95;
+
+            // Boss should still be able to use abilities even when stunned (reduced frequency)
+            if (nearest && now - (z.lastSpecialAttack || 0) >= z.specialAttackCooldown * 2) {
+                z.lastSpecialAttack = now;
+                console.log(`Boss ${z.id} using special ability while stunned at ${now}`);
+                this.useBossSpecialAbility(z, nearest, nx, ny, dist);
+            }
+        } else {
+            // Check for wall-following first if we're stuck
+            if (z.isFollowingWall) {
+                const stillFollowing = this.updateWallFollowingMovement(z, nearest, nx, ny, slowFactor);
+                if (stillFollowing) {
+                    // Still wall-following, skip normal movement
+                } else {
+                    // Wall-following ended, add a small delay before normal movement
+                    // This prevents sudden direction changes that can make zombies appear to move away
+                    const wallFollowEndDelay = 200; // 200ms delay
+                    if (now - (z.wallFollowEndTime || 0) < wallFollowEndDelay) {
+                        // Still in delay period, gradually transition to normal movement
+                        const transitionProgress = (now - (z.wallFollowEndTime || 0)) / wallFollowEndDelay;
+                        const currentSpeed = z.speed * slowFactor * transitionProgress;
+                        // Use strategic movement but with reduced speed during transition
+                        const idealDistance = 200;
+                        if (dist < idealDistance - 50) {
+                            z.vx = -nx * currentSpeed * 0.5;
+                            z.vy = -ny * currentSpeed * 0.5;
+                        } else if (dist > idealDistance + 50) {
+                            z.vx = nx * currentSpeed * 0.7;
+                            z.vy = ny * currentSpeed * 0.7;
+                        } else {
+                            const strafeX = -ny * currentSpeed * 0.3;
+                            const strafeY = nx * currentSpeed * 0.3;
+                            z.vx = strafeX;
+                            z.vy = strafeY;
+                        }
+                        return; // Skip the rest of the movement logic during transition
+                    }
+                    // Delay period ended, use normal boss movement
+                    // Strategic movement: maintain distance for ranged attacks
+                    const idealDistance = 200; // Prefer to stay at this distance
+                    if (dist < idealDistance - 50) {
+                        // Too close, back away
+                        z.vx = -nx * z.speed * 0.5 * slowFactor;
+                        z.vy = -ny * z.speed * 0.5 * slowFactor;
+                    } else if (dist > idealDistance + 50) {
+                        // Too far, move closer
+                        z.vx = nx * z.speed * 0.7 * slowFactor;
+                        z.vy = ny * z.speed * 0.7 * slowFactor;
+                    } else {
+                        // At ideal distance, strafe
+                        const strafeX = -ny * z.speed * 0.3 * slowFactor;
+                        const strafeY = nx * z.speed * 0.3 * slowFactor;
+                        z.vx = strafeX;
+                        z.vy = strafeY;
+                    }
+                }
+            } else {
+                // Normal boss movement (no wall-following)
+                // Strategic movement: maintain distance for ranged attacks
+                const idealDistance = 200; // Prefer to stay at this distance
+                if (dist < idealDistance - 50) {
+                    // Too close, back away
+                    z.vx = -nx * z.speed * 0.5 * slowFactor;
+                    z.vy = -ny * z.speed * 0.5 * slowFactor;
+                } else if (dist > idealDistance + 50) {
+                    // Too far, move closer
+                    z.vx = nx * z.speed * 0.7 * slowFactor;
+                    z.vy = ny * z.speed * 0.7 * slowFactor;
+                } else {
+                    // At ideal distance, strafe
+                    const strafeX = -ny * z.speed * 0.3 * slowFactor;
+                    const strafeY = nx * z.speed * 0.3 * slowFactor;
+                    z.vx = strafeX;
+                    z.vy = strafeY;
+                }
+            }
+        }
+
+        // Ensure boss has all required properties for abilities
+        if (!z.lastSpecialAttack) z.lastSpecialAttack = 0;
+        if (!z.lastProjectileAttack) z.lastProjectileAttack = 0;
+        if (!z.specialAbilities) z.specialAbilities = ["slow", "heal", "ranged", "meleeSlam"];
+        if (!z.specialAttackCooldown) z.specialAttackCooldown = 3000;
+        if (!z.projectileAttackCooldown) z.projectileAttackCooldown = 2000;
+
+        // Debug boss properties
+        if (Math.random() < 0.05) { // 5% chance to log
+            console.log(`Boss ${z.id} properties: lastSpecial=${z.lastSpecialAttack}, lastProjectile=${z.lastProjectileAttack}, cooldowns=${z.specialAttackCooldown}/${z.projectileAttackCooldown}`);
+        }
+
+        // Debug boss health to track if it's taking damage
+        if (z.lastHealthCheck !== z.health) {
+            if (z.lastHealthCheck && z.health < z.lastHealthCheck) {
+                console.log(`Boss ${z.id} took damage: ${z.lastHealthCheck - z.health} (${z.lastHealthCheck} -> ${z.health})`);
+            }
+            z.lastHealthCheck = z.health;
+        }
+
+        // Store old position for collision rollback
+        const oldX = z.x;
+        const oldY = z.y;
+
+        // Update position
+        z.x += z.vx * dt;
+        z.y += z.vy * dt;
+
+        // Debug boss movement occasionally
+        if (Math.random() < 0.01) { // 1% chance to log
+            console.log(`Boss ${z.id} movement: pos(${z.x.toFixed(1)}, ${z.y.toFixed(1)}), vel(${z.vx.toFixed(1)}, ${z.vy.toFixed(1)})`);
+        }
+
+        // Check wall collisions and resolve
+        this.resolveZombieWallCollisions(z, oldX, oldY, nearest);
+
+        // Special abilities every 3 seconds - simplified conditions for testing
+        if (nearest && dist >= 80 && dist <= 600 && now - (z.lastSpecialAttack || 0) >= z.specialAttackCooldown) {
+            // Only check if boss is not too close to player (simplified)
+            const tooCloseToPlayer = dist < 60;
+
+            // Debug why boss can't use abilities
+            if (Math.random() < 0.1) { // 10% chance to log
+                console.log(`Boss ${z.id} ability check: dist=${dist.toFixed(1)}, tooCloseToPlayer=${tooCloseToPlayer}`);
+            }
+
+            if (!tooCloseToPlayer) {
+                z.lastSpecialAttack = now;
+                console.log(`Boss ${z.id} using special ability at ${now}, target: ${nearest?.id || 'none'}, distance: ${dist.toFixed(1)}`);
+                this.useBossSpecialAbility(z, nearest, nx, ny, dist);
+            }
+        }
+
+        // Projectile attacks every 2 seconds - simplified conditions for testing
+        if (nearest && dist >= 60 && dist <= 700 && now - (z.lastProjectileAttack || 0) >= z.projectileAttackCooldown) {
+            // Only check if boss is not too close to player (simplified)
+            const tooCloseToPlayer = dist < 50;
+
+            // Debug why boss can't use projectile attack
+            if (Math.random() < 0.1) { // 10% chance to log
+                console.log(`Boss ${z.id} projectile check: dist=${dist.toFixed(1)}, tooCloseToPlayer=${tooCloseToPlayer}`);
+            }
+
+            if (!tooCloseToPlayer) {
+                z.lastProjectileAttack = now;
+                console.log(`Boss ${z.id} using projectile attack at ${now}, target: ${nearest?.id || 'none'}, distance: ${dist.toFixed(1)}`);
+                this.useBossProjectileAttack(z, nearest, nx, ny);
+            }
+        }
+
+        // Melee hit when close - use smaller range for boss to prevent self-damage
+        const meleeRange = z.type === "bossMob" ? 80 : (z.size || 36) * 0.7 + 20;
+        if (
+            dist <= meleeRange &&
+            now - (z.lastAttack || 0) >= z.attackCooldown
+        ) {
+            z.lastAttack = now;
+            // Apply knockback + damage
+            const kx = nx * z.knockback;
+            const ky = ny * z.knockback;
+            io.to(this.id).emit("applyKnockback", {
+                playerId: nearest.id || nearest,
+                vx: kx,
+                vy: ky,
+            });
+            nearest.health = Math.max(0, nearest.health - z.damage);
+            console.log(
+                `Server: Sending playerHit event for boss mob melee attack on player ${
+      nearest.id || nearest
+    }, new health: ${nearest.health}`
+            );
+            io.to(this.id).emit("playerHit", {
+                shooterId: "bossMob",
+                targetId: nearest.id || nearest,
+                newHealth: nearest.health,
+                damage: z.damage,
+            });
+
+            // Check for death
+            if (nearest.health <= 0) {
+                console.log(
+                    `Server: Player ${
+      nearest.id || nearest
+    } health reached 0 from boss mob melee, calling handlePlayerDeath`
+                );
+                this.handlePlayerDeath(nearest.id || nearest);
+            }
+        }
+    }
+
+    useBossSpecialAbility(z, nearest, nx, ny, dist) {
+        // Randomly select a special ability
+        const ability = z.specialAbilities[Math.floor(Math.random() * z.specialAbilities.length)];
+
+        switch (ability) {
+            case "slow":
+                // Apply slow effect to player
+                nearest.slowUntil = Date.now() + 3000; // 3 seconds
+                nearest.slowFactor = 0.3;
+                io.to(this.id).emit("playerSlowed", {
+                    playerId: nearest.id || nearest,
+                    slowFactor: 0.3,
+                    duration: 3000
+                });
+                console.log(`Boss mob ${z.id} used slow ability on player ${nearest.id || nearest}`);
+                break;
+
+            case "heal":
+                // Boss heals itself
+                const oldHealth = z.health;
+                z.health = Math.min(z.maxHealth, z.health + 50);
+                console.log(`Boss mob ${z.id} healed itself: ${oldHealth} -> ${z.health}/${z.maxHealth}`);
+                break;
+
+            case "ranged":
+                // Boss uses ranged attack (similar to penetrating arrow)
+                const projectileId = `boss-${z.id}-${Date.now()}`;
+                // Spawn projectile outside boss hitbox to prevent self-damage
+                const spawnDistance = (z.size || 60) / 2 + 20;
+                const projectile = {
+                    id: projectileId,
+                    x: z.x + nx * spawnDistance,
+                    y: z.y + ny * spawnDistance,
+                    vx: nx * 600, // Fast projectile
+                    vy: ny * 600,
+                    size: 15,
+                    damage: 30,
+                    ttl: 2.0, // Use ttl instead of lifetime for consistency
+                    penetrating: true,
+                    hitTargets: new Set(),
+                    ownerId: z.id,
+                    ownerType: "bossMob"
+                };
+                this.simProjectiles.set(projectileId, projectile);
+
+                // Send projectile to clients for visual rendering
+                io.to(this.id).emit("projectileCreate", {
+                    id: projectileId,
+                    x: projectile.x,
+                    y: projectile.y,
+                    vx: projectile.vx,
+                    vy: projectile.vy,
+                    size: 15,
+                    color: "#ff0000", // Red color for boss projectiles
+                    playerId: "bossMob",
+                    penetrating: true,
+                });
+
+                console.log(`Boss mob ${z.id} fired ranged projectile at player ${nearest.id || nearest}`);
+                break;
+
+            case "meleeSlam":
+                // Boss uses melee slam ability
+                if (dist <= 150) { // Extended range for slam
+                    const kx = nx * 600; // Strong knockback
+                    const ky = ny * 600;
+                    io.to(this.id).emit("applyKnockback", {
+                        playerId: nearest.id || nearest,
+                        vx: kx,
+                        vy: ky,
+                    });
+                    nearest.health = Math.max(0, nearest.health - 40); // High damage
+                    io.to(this.id).emit("playerHit", {
+                        shooterId: "bossMob",
+                        targetId: nearest.id || nearest,
+                        newHealth: nearest.health,
+                        damage: 40,
+                    });
+                    console.log(`Boss mob ${z.id} used melee slam on player ${nearest.id || nearest}`);
+
+                    // Check for death
+                    if (nearest.health <= 0) {
+                        this.handlePlayerDeath(nearest.id || nearest);
+                    }
+                }
+                break;
+        }
+    }
+
+    useBossProjectileAttack(z, nearest, nx, ny) {
+        // Boss fires projectile at player
+        const projectileId = `boss-proj-${z.id}-${Date.now()}`;
+        // Spawn projectile outside boss hitbox to prevent self-damage
+        const spawnDistance = (z.size || 60) / 2 + 20;
+        const projectile = {
+            id: projectileId,
+            x: z.x + nx * spawnDistance,
+            y: z.y + ny * spawnDistance,
+            vx: nx * 500, // Medium speed projectile
+            vy: ny * 500,
+            size: 12,
+            damage: 25,
+            ttl: 2.5, // Use ttl instead of lifetime for consistency
+            penetrating: false,
+            hitTargets: new Set(),
+            ownerId: z.id,
+            ownerType: "bossMob"
+        };
+        this.simProjectiles.set(projectileId, projectile);
+
+        // Send projectile to clients for visual rendering
+        io.to(this.id).emit("projectileCreate", {
+            id: projectileId,
+            x: projectile.x,
+            y: projectile.y,
+            vx: projectile.vx,
+            vy: projectile.vy,
+            size: 12,
+            color: "#ff4444", // Darker red for regular boss projectiles
+            playerId: "bossMob",
+            penetrating: false,
+        });
+
+        console.log(`Boss mob ${z.id} fired projectile at player ${nearest.id || nearest}, projectile: ${projectileId}, damage: ${projectile.damage}, size: ${projectile.size}`);
+    }
+
+    resolveZombieWallCollisions(zombie, oldX, oldY, nearest) {
+        const half = (zombie.size || 36) / 2;
+        const zombieRect = {
+            x: zombie.x - half,
+            y: zombie.y - half,
+            w: zombie.size || 36,
+            h: zombie.size || 36,
+        };
+
+        let collisionDetected = false;
+        let slideDirection = { x: 0, y: 0 };
+
+        for (const wall of this.walls) {
+            if (
+                zombieRect.x < wall.x + wall.w &&
+                zombieRect.x + zombieRect.w > wall.x &&
+                zombieRect.y < wall.y + wall.h &&
+                zombieRect.y + zombieRect.h > wall.y
+            ) {
+                collisionDetected = true;
+
+                // Calculate collision normal and slide direction
+                const centerX = zombie.x;
+                const centerY = zombie.y;
+                const wallCenterX = wall.x + wall.w / 2;
+                const wallCenterY = wall.y + wall.h / 2;
+
+                // Determine which side of the wall we're colliding with
+                const dx = centerX - wallCenterX;
+                const dy = centerY - wallCenterY;
+
+                // Calculate overlap on each axis
+                const overlapX = Math.min(
+                    Math.abs(centerX - (wall.x + wall.w)),
+                    Math.abs(centerX - wall.x)
+                );
+                const overlapY = Math.min(
+                    Math.abs(centerY - (wall.y + wall.h)),
+                    Math.abs(centerY - wall.y)
+                );
+
+                // Push out in the direction of least overlap
+                if (overlapX < overlapY) {
+                    // Horizontal collision - slide vertically
+                    if (dx > 0) {
+                        zombie.x = wall.x + wall.w + half;
+                        slideDirection.x = 0;
+                        slideDirection.y = zombie.vy > 0 ? 1 : -1;
+                    } else {
+                        zombie.x = wall.x - half;
+                        slideDirection.x = 0;
+                        slideDirection.y = zombie.vy > 0 ? 1 : -1;
+                    }
+                } else {
+                    // Vertical collision - slide horizontally
+                    if (dy > 0) {
+                        zombie.y = wall.y + wall.h + half;
+                        slideDirection.x = zombie.vx > 0 ? 1 : -1;
+                        slideDirection.y = 0;
+                    } else {
+                        zombie.y = wall.y - half;
+                        slideDirection.x = zombie.vx > 0 ? 1 : -1;
+                        slideDirection.y = 0;
+                    }
+                }
+
+                // Start wall-following behavior with a small delay for smooth transition
+                zombie.isFollowingWall = true;
+                zombie.lastWallCollision = Date.now();
+                zombie.initialWallFollowX = zombie.x;
+                zombie.initialWallFollowY = zombie.y;
+                zombie.wallFollowDistance = 0;
+                zombie.wallFollowStartTime = Date.now(); // Track when wall-following started
+                zombie.followingWallId = wall.id || `wall_${wall.x}_${wall.y}`; // Track which wall we're following
+
+                // Determine which direction to follow the wall
+                // Use a simpler, more reliable approach based on collision type and player position
+                if (overlapX < overlapY) {
+                    // Horizontal collision - follow wall vertically
+                    // Choose direction based on which side of the wall we're on and player position
+                    const zombieToPlayerY = nearest.y - zombie.y;
+                    const zombieToPlayerX = nearest.x - zombie.x;
+
+                    if (Math.abs(zombieToPlayerX) > 30) {
+                        // Player is significantly offset horizontally, choose direction to get closer to player's X
+                        if (zombieToPlayerX > 0) {
+                            // Player is to the right, move up if we're on the right side of the wall
+                            zombie.wallFollowDirection = zombie.x > wall.x + wall.w / 2 ? 'up' : 'down';
+                        } else {
+                            // Player is to the left, move up if we're on the left side of the wall
+                            zombie.wallFollowDirection = zombie.x < wall.x + wall.w / 2 ? 'up' : 'down';
+                        }
+                    } else {
+                        // Player is roughly aligned, choose based on intended movement
+                        zombie.wallFollowDirection = zombie.vy > 0 ? 'down' : 'up';
+                    }
+                } else {
+                    // Vertical collision - follow wall horizontally
+                    const zombieToPlayerX = nearest.x - zombie.x;
+                    const zombieToPlayerY = nearest.y - zombie.y;
+
+                    if (Math.abs(zombieToPlayerY) > 30) {
+                        // Player is significantly offset vertically, choose direction to get closer to player's Y
+                        if (zombieToPlayerY > 0) {
+                            // Player is below, move left if we're on the bottom side of the wall
+                            zombie.wallFollowDirection = zombie.y > wall.y + wall.h / 2 ? 'left' : 'right';
+                        } else {
+                            // Player is above, move left if we're on the top side of the wall
+                            zombie.wallFollowDirection = zombie.y < wall.y + wall.h / 2 ? 'left' : 'right';
+                        }
+                    } else {
+                        // Player is roughly aligned, choose based on intended movement
+                        zombie.wallFollowDirection = zombie.vx > 0 ? 'right' : 'left';
+                    }
+                }
+
+                // Store the initial collision wall for better corner detection
+                zombie.collisionWall = { x: wall.x, y: wall.y, w: wall.w, h: wall.h };
+                zombie.cornerDetectionDistance = 25; // Distance to start detecting corners
+
+                console.log(`Zombie ${zombie.id} started wall-following: direction=${zombie.wallFollowDirection}, vx=${zombie.vx}, vy=${zombie.vy}`);
+
+                // Apply smooth sliding movement instead of stopping completely
+                // Gradually transition to wall-following speed to prevent jumping
+                const currentSpeed = Math.sqrt(zombie.vx * zombie.vx + zombie.vy * zombie.vy);
+                const slideSpeed = currentSpeed * 0.3;
+
+                // Smoothly blend the original movement with the sliding direction
+                const blendFactor = 0.7; // Keep 70% of original movement, 30% sliding
+                if (slideDirection.x !== 0) {
+                    zombie.vx = zombie.vx * blendFactor + slideDirection.x * slideSpeed * (1 - blendFactor);
+                }
+                if (slideDirection.y !== 0) {
+                    zombie.vy = zombie.vy * blendFactor + slideDirection.y * slideSpeed * (1 - blendFactor);
+                }
+
+                break;
+            }
+        }
+
+        // Keep zombies in world bounds with sliding behavior
+        const worldW = this.worldW || 1200;
+        const worldH = this.worldH || 800;
+        const margin = half;
+
+        if (zombie.x < margin) {
+            zombie.x = margin;
+            // Allow sliding along the edge
+            zombie.vx = Math.max(0, zombie.vx);
+        }
+        if (zombie.x > worldW - margin) {
+            zombie.x = worldW - margin;
+            // Allow sliding along the edge
+            zombie.vx = Math.min(0, zombie.vx);
+        }
+        if (zombie.y < margin) {
+            zombie.y = margin;
+            // Allow sliding along the edge
+            zombie.vy = Math.max(0, zombie.vy);
+        }
+        if (zombie.y > worldH - margin) {
+            zombie.y = worldH - margin;
+            // Allow sliding along the edge
+            zombie.vy = Math.min(0, zombie.vy);
+        }
+    }
+
+    // Wall-following movement logic for zombies
+    updateWallFollowingMovement(zombie, nearest, nx, ny, slowFactor) {
+        const now = Date.now();
+        const wallFollowTimeout = 8000; // Increased timeout to prevent premature exits
+        const wallFollowStartDelay = 150; // Slightly longer start delay for smoother transitions
+
+        // Check if we're still in the start delay period
+        if (now - (zombie.wallFollowStartTime || 0) < wallFollowStartDelay) {
+            const blendProgress = (now - (zombie.wallFollowStartTime || 0)) / wallFollowStartDelay;
+            const wallFollowBlend = blendProgress * 0.9; // More gradual blending
+
+            this.applyWallFollowingMovement(zombie, nearest, nx, ny, slowFactor, wallFollowBlend);
+        }
+
+        // Safety check: ensure we have a valid wall-following direction
+        if (!zombie.wallFollowDirection) {
+            console.log(`Zombie ${zombie.id} has no wallFollowDirection, resetting wall-following`);
+            zombie.isFollowingWall = false;
+            zombie.wallFollowDirection = null;
+            zombie.initialWallFollowX = 0;
+            zombie.initialWallFollowY = 0;
+            zombie.wallFollowDistance = 0;
+            zombie.followingWallId = null;
+            zombie.collisionWall = null;
+            zombie.cornerDetectionDistance = 0;
+            return false;
+        }
+
+        // Check timeout first
+        if (now - zombie.lastWallCollision > wallFollowTimeout) {
+            console.log(`Zombie ${zombie.id} wall-following timeout, exiting`);
+            zombie.isFollowingWall = false;
+            zombie.wallFollowDirection = null;
+            zombie.initialWallFollowX = 0;
+            zombie.initialWallFollowY = 0;
+            zombie.wallFollowDistance = 0;
+            zombie.wallFollowEndTime = now; // Add transition delay
+            zombie.followingWallId = null;
+            zombie.collisionWall = null;
+            zombie.cornerDetectionDistance = 0;
+            return false;
+        }
+
+        // Update progress tracking
+        if (zombie.wallFollowDirection === 'left' || zombie.wallFollowDirection === 'right') {
+            zombie.wallFollowDistance = Math.abs(zombie.x - zombie.initialWallFollowX);
+        } else {
+            zombie.wallFollowDistance = Math.abs(zombie.y - zombie.initialWallFollowY);
+        }
+
+        // Stuck detection: if we haven't made progress in the last 5 seconds, try to exit
+        const lastProgressTime = zombie.lastProgressTime || zombie.lastWallCollision;
+        if (now - lastProgressTime > 5000 && zombie.wallFollowDistance < 20) {
+            console.log(`Zombie ${zombie.id} stuck for 5 seconds (distance: ${zombie.wallFollowDistance.toFixed(1)}px), forcing exit from wall-following`);
+            zombie.isFollowingWall = false;
+            zombie.wallFollowDirection = null;
+            zombie.initialWallFollowX = 0;
+            zombie.initialWallFollowY = 0;
+            zombie.wallFollowDistance = 0;
+            zombie.wallFollowEndTime = now; // Add transition delay
+            zombie.followingWallId = null;
+            zombie.collisionWall = null;
+            zombie.cornerDetectionDistance = 0;
+            return false;
+        }
+
+        // Update progress time if we're making progress
+        if (zombie.wallFollowDistance > (zombie.lastProgressDistance || 0)) {
+            zombie.lastProgressTime = now;
+            zombie.lastProgressDistance = zombie.wallFollowDistance;
+        }
+
+        // Corner detection and smooth navigation
+        if (zombie.collisionWall && zombie.wallFollowDistance >= zombie.cornerDetectionDistance) {
+            const wall = zombie.collisionWall;
+            const half = zombie.radius || 15;
+
+            // Check if we're approaching a corner
+            let approachingCorner = false;
+            let newDirection = null;
+
+            if (zombie.wallFollowDirection === 'up' || zombie.wallFollowDirection === 'down') {
+                // Moving vertically along a horizontal wall
+                if (zombie.wallFollowDirection === 'up') {
+                    // Check if we're near the top edge of the wall
+                    if (Math.abs(zombie.y - wall.y) < 30) {
+                        approachingCorner = true;
+                        // Turn right if we're on the right side, left if on the left side
+                        newDirection = zombie.x > wall.x + wall.w / 2 ? 'right' : 'left';
+                    }
+                } else { // down
+                    // Check if we're near the bottom edge of the wall
+                    if (Math.abs(zombie.y - (wall.y + wall.h)) < 30) {
+                        approachingCorner = true;
+                        // Turn right if we're on the right side, left if on the left side
+                        newDirection = zombie.x > wall.x + wall.w / 2 ? 'right' : 'left';
+                    }
+                }
+            } else { // left or right
+                // Moving horizontally along a vertical wall
+                if (zombie.wallFollowDirection === 'left') {
+                    // Check if we're near the left edge of the wall
+                    if (Math.abs(zombie.x - wall.x) < 30) {
+                        approachingCorner = true;
+                        // Turn down if we're on the bottom side, up if on the top side
+                        newDirection = zombie.y > wall.y + wall.h / 2 ? 'down' : 'up';
+                    }
+                } else { // right
+                    // Check if we're near the right edge of the wall
+                    if (Math.abs(zombie.x - (wall.x + wall.w)) < 30) {
+                        approachingCorner = true;
+                        // Turn down if we're on the bottom side, up if on the top side
+                        newDirection = zombie.y > wall.y + wall.h / 2 ? 'down' : 'up';
+                    }
+                }
+            }
+
+            // If approaching a corner, smoothly change direction
+            if (approachingCorner && newDirection) {
+                console.log(`Zombie ${zombie.id} approaching corner, changing direction from ${zombie.wallFollowDirection} to ${newDirection}`);
+                zombie.wallFollowDirection = newDirection;
+                zombie.initialWallFollowX = zombie.x;
+                zombie.initialWallFollowY = zombie.y;
+                zombie.wallFollowDistance = 0;
+                zombie.cornerDetectionDistance = 35; // Increase detection distance for next corner
+            }
+        }
+
+        // Check if we can see the player clearly now
+        const canSeePlayer = this.hasLineOfSight(zombie.x, zombie.y, nearest.x, nearest.y);
+
+        // Only exit if we have a clear line of sight AND we've moved significantly along the wall
+        if (canSeePlayer && zombie.wallFollowDistance >= 50) {
+            // Check if we've actually cleared the obstacle by testing if we can move towards the player
+            const testDistance = 25; // Test if we can move 25px towards the player
+            const playerDirX = nearest.x > zombie.x ? 1 : nearest.x < zombie.x ? -1 : 0;
+            const playerDirY = nearest.y > zombie.y ? 1 : nearest.y < zombie.y ? -1 : 0;
+
+            // Test if moving towards the player would hit a wall
+            const testX = zombie.x + playerDirX * testDistance;
+            const testY = zombie.y + playerDirY * testDistance;
+
+            let canMoveTowardsPlayer = true;
+            for (const wall of this.walls) {
+                const half = zombie.radius || 15;
+                if (testX + half > wall.x && testX - half < wall.x + wall.w &&
+                    testY + half > wall.y && testY - half < wall.y + wall.h) {
+                    canMoveTowardsPlayer = false;
+                    break;
+                }
+            }
+
+            if (canMoveTowardsPlayer) {
+                console.log(`Zombie ${zombie.id} cleared wall after moving ${zombie.wallFollowDistance.toFixed(1)}px, exiting wall-following`);
+                zombie.isFollowingWall = false;
+                zombie.wallFollowDirection = null;
+                zombie.initialWallFollowX = 0;
+                zombie.initialWallFollowY = 0;
+                zombie.wallFollowDistance = 0;
+                zombie.wallFollowEndTime = 0; // No delay needed, head straight to player
+                zombie.followingWallId = null;
+                zombie.collisionWall = null;
+                zombie.cornerDetectionDistance = 0;
+                return false;
+            }
+        }
+
+        // Wall-following movement - use consistent speed
+        const followSpeed = zombie.speed * 0.7 * slowFactor; // Slightly slower for better control
+
+        switch (zombie.wallFollowDirection) {
+            case 'left':
+                zombie.vx = -followSpeed;
+                zombie.vy = 0;
+                break;
+            case 'right':
+                zombie.vx = followSpeed;
+                zombie.vy = 0;
+                break;
+            case 'up':
+                zombie.vx = 0;
+                zombie.vy = -followSpeed;
+                break;
+            case 'down':
+                zombie.vx = 0;
+                zombie.vy = followSpeed;
+                break;
+            default:
+                console.log(`Zombie ${zombie.id} has invalid wallFollowDirection: ${zombie.wallFollowDirection}`);
+                return false;
+        }
+
+        return true; // Still wall-following
+    }
+
+    // Apply wall-following movement with blending for smooth transitions
+    applyWallFollowingMovement(zombie, nearest, nx, ny, slowFactor, blendFactor) {
+        const followSpeed = zombie.speed * 0.8 * slowFactor;
+        let wallFollowVx = 0;
+        let wallFollowVy = 0;
+
+        // Calculate wall-following velocity
+        switch (zombie.wallFollowDirection) {
+            case 'left':
+                wallFollowVx = -followSpeed;
+                wallFollowVy = 0;
+                break;
+            case 'right':
+                wallFollowVx = followSpeed;
+                wallFollowVy = 0;
+                break;
+            case 'up':
+                wallFollowVx = 0;
+                wallFollowVy = -followSpeed;
+                break;
+            case 'down':
+                wallFollowVx = 0;
+                wallFollowVy = followSpeed;
+                break;
+        }
+
+        // Blend wall-following movement with original movement direction
+        const originalVx = nx * zombie.speed * slowFactor;
+        const originalVy = ny * zombie.speed * slowFactor;
+
+        zombie.vx = originalVx * (1 - blendFactor) + wallFollowVx * blendFactor;
+        zombie.vy = originalVy * (1 - blendFactor) + wallFollowVy * blendFactor;
+    }
+
+    // Helper method for line-of-sight checking
+    hasLineOfSight(x1, y1, x2, y2) {
+        // Simple line-of-sight: check if line intersects any wall
+        for (const wall of this.walls) {
+            if (this.lineIntersectsRect(x1, y1, x2, y2, wall)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Check if a projectile collides with any wall
+    checkProjectileWallCollision(projectile, oldX, oldY) {
+        // Use line-based collision detection for more accurate results
+        // Check if the line from old position to new position intersects any wall
+
+        for (const wall of this.walls) {
+            if (
+                this.lineIntersectsRect(oldX, oldY, projectile.x, projectile.y, wall)
+            ) {
+                // Wall collision detected - projectile should be destroyed
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Helper method to check if a line intersects with a rectangle
+    lineIntersectsRect(x1, y1, x2, y2, rect) {
+        // Check if either endpoint is inside the rectangle
+        if (
+            x1 >= rect.x &&
+            x1 <= rect.x + rect.w &&
+            y1 >= rect.y &&
+            y1 <= rect.y + rect.h
+        )
+            return true;
+        if (
+            x2 >= rect.x &&
+            x2 <= rect.x + rect.w &&
+            y2 >= rect.y &&
+            y2 <= rect.y + rect.h
+        )
+            return true;
+
+        // Check line intersection with each edge of the rectangle
+        const edges = [
+            { x1: rect.x, y1: rect.y, x2: rect.x + rect.w, y2: rect.y }, // top
+            {
+                x1: rect.x + rect.w,
+                y1: rect.y,
+                x2: rect.x + rect.w,
+                y2: rect.y + rect.h,
+            }, // right
+            {
+                x1: rect.x + rect.w,
+                y1: rect.y + rect.h,
+                x2: rect.x,
+                y2: rect.y + rect.h,
+            }, // bottom
+            { x1: rect.x, y1: rect.y + rect.h, x2: rect.x, y2: rect.y }, // left
+        ];
+
+        for (const edge of edges) {
+            if (
+                this.linesIntersect(x1, y1, x2, y2, edge.x1, edge.y1, edge.x2, edge.y2)
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Helper method to check if two line segments intersect
+    linesIntersect(x1, y1, x2, y2, x3, y3, x4, y4) {
+        const denom = (y4 - y3) * (x2 - x1) - (x4 - x3) * (y2 - y1);
+        if (denom === 0) return false; // parallel lines
+
+        const ua = ((x4 - x3) * (y1 - y3) - (y4 - y3) * (x1 - x3)) / denom;
+        const ub = ((x2 - x1) * (y1 - y3) - (y2 - y1) * (x1 - x3)) / denom;
+
+        return ua >= 0 && ua <= 1 && ub >= 0 && ub <= 1;
+    }
+
+    // Helper method to check if a position is inside any wall
+    isPositionInWall(x, y) {
+        for (const wall of this.walls) {
+            if (
+                x >= wall.x &&
+                x <= wall.x + wall.w &&
+                y >= wall.y &&
+                y <= wall.y + wall.h
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Update projectiles and handle collisions
+    updateProjectiles(dt) {
+        if (!this.simProjectiles) this.simProjectiles = new Map();
+        const toDelete = [];
+
+        // Debug: Log projectile count
+        if (this.simProjectiles.size > 0 && Math.random() < 0.1) {
+            console.log(`Server: Updating ${this.simProjectiles.size} projectiles in ${this.gameMode} mode`);
+        }
+
+        this.simProjectiles.forEach((p, pid) => {
+            // Store old position for collision rollback
+            const oldX = p.x;
+            const oldY = p.y;
+
+            p.x += p.vx * dt;
+            p.y += p.vy * dt;
+            p.ttl -= dt;
+
+            // Debug boss projectiles movement
+            if (p.ownerType === "bossMob" && Math.random() < 0.1) { // 10% chance to log
+                console.log(`Boss projectile ${pid} at (${p.x.toFixed(1)}, ${p.y.toFixed(1)}), ttl: ${p.ttl.toFixed(1)}, damage: ${p.damage}`);
+            }
+
+            if (p.ttl <= 0) {
+                toDelete.push(pid);
+                return;
+            }
+            if (p.x < -50 || p.x > 1250 || p.y < -50 || p.y > 850) {
+                toDelete.push(pid);
+                return;
+            }
+
+            // Check wall collisions and resolve
+            if (this.checkProjectileWallCollision(p, oldX, oldY)) {
+                // Debug logging for wall hits
+                if (Math.random() < 0.1) {
+                    // Log 10% of wall hits to avoid spam
+                    console.log(
+                        `Projectile ${pid} hit wall at (${oldX.toFixed(1)}, ${oldY.toFixed(1)})`
+                    );
+                }
+
+                // Emit wall hit effect to clients
+                io.to(this.id).emit("projectileWallHit", {
+                    x: oldX,
+                    y: oldY,
+                    projectileId: pid,
+                    ownerId: p.ownerId,
+                });
+                toDelete.push(pid);
+                return;
+            }
+            // Hit players (always check for boss projectiles, or in deathmatch mode for player projectiles)
+            if (p.ownerType === "bossMob" || this.gameMode === "deathmatch") {
+                this.players.forEach((tgt, tid) => {
+                    if (toDelete.includes(pid)) return;
+                    if (p.ownerId === tid) return;
+
+                    // For penetrating arrows, check if we've already hit this target
+                    if (p.penetrating && p.hitTargets && p.hitTargets.has(`player-${tid}`))
+                        return;
+
+                    const dx = tgt.x - p.x;
+                    const dy = tgt.y - p.y;
+                    const r = (p.size || 10) + 20;
+                    if (dx * dx + dy * dy <= r * r) {
+                        console.log(
+                            `Server: Projectile ${pid} hit player ${tid} at distance ${Math.sqrt(dx * dx + dy * dy).toFixed(1)}, hit radius: ${r}, ownerType: ${p.ownerType}`
+                        ); // Debug log
+                        tgt.health = Math.max(0, tgt.health - p.damage);
+                        console.log(
+                            `Server: Sending playerHit event for projectile hit on player ${tid}, new health: ${tgt.health}, damage: ${p.damage}`
+                        ); // Debug log
+                        io.to(this.id).emit("playerHit", {
+                            shooterId: p.ownerId,
+                            targetId: tid,
+                            newHealth: tgt.health,
+                            damage: p.damage,
+                            hitX: p.x,
+                            hitY: p.y,
+                        });
+
+                        // Check for death
+                        if (tgt.health <= 0) {
+                            console.log(
+                                `Server: Player ${tid} health reached 0, calling handlePlayerDeath`
+                            ); // Debug log
+
+                            // Award kill points to the shooter (only if target wasn't already dead)
+                            if (!tgt.isDead) {
+                                const shooter = this.players.get(p.ownerId);
+                                if (shooter) {
+                                    shooter.kills++;
+                                    shooter.score = (shooter.score || 0) + 100; // 100 points for PvP kill
+                                    console.log(`Server: Player ${shooter.name} killed ${tgt.name} in deathmatch, awarded 100 points`);
+
+                                    // Send score update only if shooter is a valid player
+                                    io.to(this.id).emit("scoreUpdate", {
+                                        playerId: p.ownerId,
+                                        newScore: shooter.score,
+                                    });
+                                }
+                            }
+
+                            this.handlePlayerDeath(tid);
+                        }
+
+                        // For penetrating arrows, mark this target as hit instead of deleting projectile
+                        if (p.penetrating && p.hitTargets) {
+                            p.hitTargets.add(`player-${tid}`);
+                        } else {
+                            toDelete.push(pid);
+                        }
+                    }
+                });
+            }
+            if (toDelete.includes(pid)) return;
+
+            // Skip zombie hit detection for deathmatch mode
+            if (this.gameMode === "deathmatch") return;
+
+            // Hit zombies (award score and remove projectile visually)
+            this.zombies.forEach((z, zid) => {
+                if (toDelete.includes(pid)) return;
+
+                // For penetrating arrows, check if we've already hit this target
+                if (p.penetrating && p.hitTargets && p.hitTargets.has(`zombie-${zid}`))
+                    return;
+
+                // Prevent boss mobs from hitting themselves with their own projectiles
+                if (p.ownerId === zid) return;
+
+                // Prevent boss mobs from hitting other zombies (friendly fire)
+                if (p.ownerType === "bossMob" && z.type === "bossMob") return;
+
+                const dx = z.x - p.x;
+                const dy = z.y - p.y;
+                const distance = Math.sqrt(dx * dx + dy * dy);
+                // More generous hit radius for better hit registration
+                const hitRadius = (p.size || 10) + (z.size || 36) * 0.6; // Increased from /2 to *0.6
+
+                if (distance <= hitRadius) {
+                    // Apply damage to zombie
+                    z.health = Math.max(0, z.health - p.damage);
+                    const shooter = this.players.get(p.ownerId);
+
+                    // Debug: Log successful hits occasionally
+                    if (Math.random() < 0.05) {
+                        // 5% chance to log
+                        console.log(
+                            `Projectile hit zombie: distance=${distance.toFixed(1)}, hitRadius=${hitRadius.toFixed(1)}, damage=${p.damage}, penetrating=${!!p.penetrating}`
+                        );
+                    }
+
+                    // Award points for hitting zombie (balanced scoring)
+                    if (shooter) {
+                        const hitPoints = p.penetrating ? 4 : 2; // Bonus for penetrating arrow hits
+                        shooter.score = (shooter.score || 0) + hitPoints;
+                        io.to(this.id).emit("scoreUpdate", {
+                            playerId: p.ownerId,
+                            newScore: shooter.score,
+                        });
+                    }
+
+                    // If zombie dies, award bonus points and remove it
+                    if (z.health <= 0) {
+                        this.zombies.delete(zid);
+                        if (shooter) {
+                            const killBonus = p.penetrating ? 20 : 10; // Extra bonus for penetrating arrow kills
+                            shooter.score = (shooter.score || 0) + killBonus;
+                            io.to(this.id).emit("scoreUpdate", {
+                                playerId: p.ownerId,
+                                newScore: shooter.score,
+                            });
+                        }
+                    }
+
+                    // For penetrating arrows, mark this target as hit instead of deleting projectile
+                    if (p.penetrating && p.hitTargets) {
+                        p.hitTargets.add(`zombie-${zid}`);
+                        // Still send hit confirmation but don't delete projectile
+                        io.to(this.id).emit("projectileHit", {
+                            shooterId: p.ownerId,
+                            hitX: p.x,
+                            hitY: p.y,
+                            penetrating: true, // Let client know this is a penetrating hit
+                        });
+                    } else {
+                        // Remove projectile and send hit confirmation to clients
+                        io.to(this.id).emit("projectileHit", {
+                            shooterId: p.ownerId,
+                            hitX: p.x,
+                            hitY: p.y,
+                        });
+                        toDelete.push(pid);
+                    }
+                }
+            });
+        });
+        toDelete.forEach((pid) => {
+            const projectile = this.simProjectiles.get(pid);
+            if (projectile && projectile.ownerType === "bossMob") {
+                console.log(`Deleting boss projectile ${pid} at (${projectile.x.toFixed(1)}, ${projectile.y.toFixed(1)})`);
+            }
+            this.simProjectiles.delete(pid);
+        });
+    }
+
+    // Update player states and broadcast
+    updatePlayerStates(dt) {
+        this.playersBroadcastAccum = (this.playersBroadcastAccum || 0) + dt;
+        if (this.playersBroadcastAccum >= 0.1) {
+            this.playersBroadcastAccum = 0;
+            if (this.players && this.players.size > 0) {
+                const playersList = Array.from(this.players.values()).map((p) => ({
+                    id: p.id,
+                    name: p.name,
+                    score: p.score,
+                    lives: p.lives,
+                    deaths: p.deaths,
+                    kills: p.kills,
+                    isDead: p.isDead,
+                    health: p.health,
+                }));
+                io.to(this.id).emit("playersState", { players: playersList });
+            }
+        }
+    }
+
+    updateAreaEffects(now, dt) {
+        const expiredEffects = [];
+
+        this.areaEffects.forEach((effect, effectId) => {
+            // Check if effect has expired
+            if (now > effect.expiresAt) {
+                expiredEffects.push(effectId);
+                return;
+            }
+
+            // Apply effect to entities in the area
+            if (effect.type === "slow") {
+                // Check players
+                this.players.forEach((p, pid) => {
+                    if (pid === effect.casterId) return; // Don't affect caster
+                    const dx = p.x - effect.x;
+                    const dy = p.y - effect.y;
+                    if (dx * dx + dy * dy <= effect.radius * effect.radius) {
+                        // Apply slow if not already slowed by this effect
+                        if (!p.slowUntil || now > p.slowUntil) {
+                            p.slowUntil = now + 500; // Short refresh duration, reapplied each frame
+                            io.to(this.id).emit("applySlow", {
+                                playerId: pid,
+                                duration: 500,
+                            });
+                        }
+                    }
+                });
+
+                // Check zombies
+                if (this.zombies) {
+                    this.zombies.forEach((z) => {
+                        const dx = z.x - effect.x;
+                        const dy = z.y - effect.y;
+                        if (dx * dx + dy * dy <= effect.radius * effect.radius) {
+                            // Apply slow if not already slowed
+                            if (!z.slowUntil || now > z.slowUntil) {
+                                z.slowUntil = now + 500; // Short refresh duration, reapplied each frame
+                            }
+                        }
+                    });
+                }
+            }
+        });
+
+        // Remove expired effects
+        expiredEffects.forEach((id) => this.areaEffects.delete(id));
+    }
+
+    handlePlayerDeath(playerId) {
+        console.log(`Server: handlePlayerDeath called with playerId: ${playerId}`); // Debug log
+
+        const player = this.players.get(playerId);
+        if (!player) {
+            console.log(`Server: handlePlayerDeath - player ${playerId} not found`); // Debug log
+            return;
+        }
+        if (player.isDead) {
+            console.log(
+                `Server: handlePlayerDeath - player ${playerId} already dead`
+            ); // Debug log
+            return;
+        }
+
+        console.log(
+            `Server: handlePlayerDeath - player ${player.name} (${playerId}) found and not dead, proceeding with death handling`
+        ); // Debug log
+
+        console.log(`Server: handlePlayerDeath called for player ${playerId}`); // Debug log
+
+        // Player dies
+        player.isDead = true;
+        player.health = 0; // Set health to 0 when player dies
+        player.deaths++;
+        player.lives--;
+
+        console.log(
+            `Server: Player ${player.name} state updated - isDead: ${player.isDead}, health: ${player.health}, lives: ${player.lives}`
+        ); // Debug log
+        console.log(`Server: Player ${player.name} deaths: ${player.deaths}`); // Debug log
+
+        console.log(`Player ${player.name} died. Lives remaining: ${player.lives}`);
+
+        if (player.lives > 0) {
+            // Set respawn time (5 seconds from now)
+            player.respawnTime = Date.now() + 5000;
+
+            console.log(
+                `Server: Player ${player.name} respawn time set to ${new Date(
+          player.respawnTime
+        ).toLocaleTimeString()}`
+            ); // Debug log
+
+            console.log(`Server: Sending playerDeath event for ${player.name}`); // Debug log
+
+            // Notify clients about death and respawn timer
+            const deathEvent = {
+                playerId: playerId,
+                playerName: player.name,
+                livesRemaining: player.lives,
+                respawnIn: 5000,
+                health: 0, // Include health update
+            };
+            console.log(`Server: playerDeath event data:`, deathEvent); // Debug log
+            io.to(this.id).emit("playerDeath", deathEvent);
+
+            // Schedule respawn
+            console.log(
+                `Server: Scheduling respawn for player ${playerId} in 5 seconds`
+            ); // Debug log
+            const respawnTimeout = setTimeout(() => {
+                console.log(`Server: Respawn timeout triggered for player ${playerId}`); // Debug log
+                this.respawnPlayer(playerId);
+            }, 5000);
+
+            // Store the timeout ID for potential cancellation
+            player.respawnTimeoutId = respawnTimeout;
+        } else {
+            // No lives left - permanent death
+            console.log(`Server: Sending playerEliminated event for ${player.name}`); // Debug log
+
+            const eliminationEvent = {
+                playerId: playerId,
+                playerName: player.name,
+                health: 0, // Include health update
+            };
+            console.log(`Server: playerEliminated event data:`, eliminationEvent); // Debug log
+            io.to(this.id).emit("playerEliminated", eliminationEvent);
+
+            // Check if deathmatch should end after player elimination
+            if (this.gameMode === "deathmatch") {
+                this.checkDeathmatchEnd();
+            }
+        }
+
+        // Check if deathmatch should end (only one player remaining)
+        if (this.gameMode === "deathmatch") {
+            this.checkDeathmatchEnd();
+        }
+    }
+
+    checkDeathmatchEnd() {
+        // Count alive players (players with lives remaining)
+        let alivePlayers = 0;
+        let lastAlivePlayer = null;
+
+        this.players.forEach((player) => {
+            if (player.lives > 0) {
+                alivePlayers++;
+                lastAlivePlayer = player;
+            }
+        });
+
+        // If only one player remains alive, end the deathmatch
+        if (alivePlayers <= 1) {
+            console.log(`Server: Deathmatch ending - only ${alivePlayers} player(s) remaining`);
+
+            // Find the winner (player with highest score)
+            let winner = null;
+            let highestScore = -1;
+
+            this.players.forEach((player) => {
+                if (player.score > highestScore) {
+                    highestScore = player.score;
+                    winner = {
+                        id: player.id,
+                        name: player.name,
+                        score: player.score,
+                        kills: player.kills,
+                        deaths: player.deaths
+                    };
+                }
+            });
+
+            // End the game
+            this.endGame();
+        }
+    }
+
+    respawnPlayer(playerId) {
+        console.log(`Server: respawnPlayer called with playerId: ${playerId}`); // Debug log
+
+        const player = this.players.get(playerId);
+        if (!player) {
+            console.log(`Server: respawnPlayer - player ${playerId} not found`); // Debug log
+            return;
+        }
+        if (!player.isDead) {
+            console.log(`Server: respawnPlayer - player ${playerId} not dead`); // Debug log
+            return;
+        }
+        if (player.lives <= 0) {
+            console.log(
+                `Server: respawnPlayer - player ${playerId} no lives remaining`
+            ); // Debug log
+            return;
+        }
+
+        console.log(
+            `Server: respawnPlayer - player ${player.name} (${playerId}) found, dead, and has lives remaining, proceeding with respawn`
+        ); // Debug log
+
+        console.log(`Server: respawnPlayer called for player ${playerId}`); // Debug log
+
+        // Clear any existing respawn timeout
+        if (player.respawnTimeoutId) {
+            clearTimeout(player.respawnTimeoutId);
+            player.respawnTimeoutId = null;
+            console.log(`Server: Cleared respawn timeout for player ${player.name}`); // Debug log
+        }
+
+        // Reset player state
+        player.isDead = false;
+        player.health = 100;
+        player.respawnTime = 0;
+
+        console.log(
+            `Server: Player ${player.name} state reset - isDead: ${player.isDead}, health: ${player.health}, respawnTime: ${player.respawnTime}`
+        ); // Debug log
+
+        // Find safe spawn location
+        player.x = Math.random() * 600 + 100;
+        player.y = Math.random() * 400 + 100;
+
+        console.log(
+            `Server: Player ${player.name} spawn location set to (${player.x.toFixed(
+        1
+      )}, ${player.y.toFixed(1)})`
+        ); // Debug log
+
+        // Brief invulnerability
+        player.isInvulnerable = true;
+        console.log(
+            `Server: Player ${player.name} invulnerability set to true for 3 seconds`
+        ); // Debug log
+
+        setTimeout(() => {
+            if (this.players.has(playerId)) {
+                const player = this.players.get(playerId);
+                player.isInvulnerable = false;
+                console.log(`Server: Player ${player.name} invulnerability removed`); // Debug log
+            }
+        }, 3000);
+
+        console.log(
+            `Player ${player.name} respawned with ${player.lives} lives remaining`
+        );
+
+        console.log(`Server: Sending playerRespawn event for ${player.name}`); // Debug log
+
+        // Notify clients about respawn
+        const respawnEvent = {
+            playerId: playerId,
+            playerName: player.name,
+            x: player.x,
+            y: player.y,
+            livesRemaining: player.lives,
+        };
+        console.log(`Server: playerRespawn event data:`, respawnEvent); // Debug log
+        io.to(this.id).emit("playerRespawn", respawnEvent);
+    }
+
+    respawnNPC() {
+        if (!this.npc) return;
+        // Move to a random valid location within world bounds used on client (1200x800)
+        const W = 1200;
+        const H = 800;
+        this.npc.x = Math.random() * (W - 200) + 100;
+        this.npc.y = Math.random() * (H - 200) + 100;
+        this.npc.health = this.npc.maxHealth;
+        io.to(this.id).emit("npcState", { npc: this.npc });
+    }
+
+    updatePlayerPosition(playerId, x, y) {
+        const player = this.players.get(playerId);
+        if (player) {
+            player.x = x;
+            player.y = y;
+        }
+    }
+
+    handlePlayerShot(playerId, targetX, targetY, weapon) {
+        const shooter = this.players.get(playerId);
+        if (!shooter) return;
+
+        // Client-side already handles fire rate, so we don't need server-side rate limiting
+        // shooter.lastShot is still updated for other purposes but not used for rate limiting
+
+        // Check for hits on other players and remove projectile after first hit
+        this.players.forEach((target, targetId) => {
+            if (targetId === playerId) return;
+
+            const distance = Math.sqrt(
+                Math.pow(target.x - targetX, 2) + Math.pow(target.y - targetY, 2)
+            );
+
+            if (distance <= weapon.projectileSize) {
+                // Hit!
+                let damage = weapon.damage;
+                // Melee damage boost if stored
+                if (shooter.chosenClass === "melee" && shooter.meleeCharge) {
+                    damage += Math.min(40, shooter.meleeCharge);
+                    shooter.meleeCharge = 0;
+                }
+                // Blocking reduces damage only if facing the attacker
+                if (target.isBlocking) {
+                    // Require facing within 90 degrees (front arc)
+                    const attackAngle = Math.atan2(
+                        targetY - target.y,
+                        targetX - target.x
+                    );
+                    const facingAngle = (target.blockAngle || 0) * (Math.PI / 180);
+                    let diff = Math.abs(attackAngle - facingAngle);
+                    if (diff > Math.PI) diff = 2 * Math.PI - diff;
+                    const withinFrontArc = diff <= Math.PI / 2;
+                    if (withinFrontArc) {
+                        const reduced = Math.floor(damage * 0.4); // stronger block (60% reduction)
+                        const prevented = damage - reduced;
+                        damage = reduced;
+                        target.meleeCharge = Math.min(
+                            60,
+                            (target.meleeCharge || 0) + prevented
+                        );
+                    }
+                }
+
+                target.health = Math.max(0, target.health - damage);
+                shooter.score += 5; // Reduced PvP hit points
+
+                // Check for death
+                if (target.health <= 0) {
+                    this.handlePlayerDeath(targetId);
+                    shooter.kills++;
+                    shooter.score += 25; // Reduced PvP kill bonus
+                }
+
+                // Emit hit effect
+                io.to(this.id).emit("playerHit", {
+                    targetId,
+                    damage,
+                    newHealth: target.health,
+                    shooterId: playerId,
+                    shooterScore: shooter.score,
+                });
+            }
+        });
+
+        // Check hit on NPC dummy (simple point distance to impact target)
+        if (this.npc && typeof this.npc.x === "number") {
+            const ndx = this.npc.x - targetX;
+            const ndy = this.npc.y - targetY;
+            const ndist = Math.sqrt(ndx * ndx + ndy * ndy);
+            if (ndist <= weapon.projectileSize + 18) {
+                this.npc.health = Math.max(0, this.npc.health - weapon.damage);
+                if (this.npc.health <= 0) {
+                    this.respawnNPC();
+                } else {
+                    io.to(this.id).emit("npcState", { npc: this.npc });
+                }
+            }
+        }
+    }
+
+    // Simulate a projectile traveling from shooter to target with weapon stats
+    spawnSimulatedProjectile(ownerId, startX, startY, targetX, targetY, weapon) {
+        const angle = Math.atan2(targetY - startY, targetX - startX);
+        const vx = Math.cos(angle) * weapon.projectileSpeed;
+        const vy = Math.sin(angle) * weapon.projectileSpeed;
+        const id = `p-${ownerId}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+        // TTL in seconds
+        const ttl = Number(weapon.projectileLifetime) || 2.0;
+
+        // Check if starting position is inside a wall
+        if (this.isPositionInWall(startX, startY)) {
+            console.log(
+                `Projectile ${id} spawned inside wall at (${startX}, ${startY}), skipping`
+            );
+            return; // Don't spawn projectile if it starts inside a wall
+        }
+
+        this.simProjectiles = this.simProjectiles || new Map();
+        this.simProjectiles.set(id, {
+            x: startX,
+            y: startY,
+            vx,
+            vy,
+            size: Number(weapon.projectileSize) || 10,
+            damage: Number(weapon.damage) || 10,
+            ttl,
+            ownerId,
+            projectileId: id,
+            isNpc: false,
+        });
+
+        console.log(
+            `Server: Spawned projectile ${id} from player ${ownerId} at (${startX.toFixed(1)}, ${startY.toFixed(1)}) towards (${targetX.toFixed(1)}, ${targetY.toFixed(1)}) with damage ${weapon.damage}`
+        );
+    }
+}
+
+// Socket.IO connection handling
+io.on("connection", (socket) => {
+    console.log("User connected:", socket.id);
+
+    // Join lobby
+    socket.on("joinLobby", (data) => {
+        const { lobbyId, playerName } = data;
+        const lobby = lobbies.get(lobbyId);
+
+        if (lobby && lobby.players.size < lobby.maxPlayers) {
+            const addResult = lobby.addPlayer(socket.id, playerName);
+            if (addResult && addResult.error) {
+                socket.emit("joinedLobby", {
+                    success: false,
+                    message: addResult.error,
+                });
+                return;
+            }
+            if (addResult === false) {
+                socket.emit("joinedLobby", {
+                    success: false,
+                    message: "Lobby is full",
+                });
+                return;
+            }
+            socket.join(lobbyId);
+            players.set(socket.id, { lobbyId, playerName });
+
+            // Emit updated lobby info
+            io.to(lobbyId).emit("lobbyUpdate", {
+                players: Array.from(lobby.players.values()),
+                gameState: lobby.gameState,
+                gameStartTime: lobby.gameStartTime,
+                gameMode: lobby.gameMode,
+            });
+
+            socket.emit("joinedLobby", { success: true, lobbyId });
+        } else {
+            socket.emit("joinedLobby", {
+                success: false,
+                message: "Lobby full or not found",
+            });
+        }
+    });
+
+    // Create lobby
+    socket.on("createLobby", (data) => {
+        const { playerName } = data;
+        const lobby = new Lobby(`${playerName}'s Lobby`, socket.id);
+
+        lobbies.set(lobby.id, lobby);
+        socket.join(lobby.id);
+        lobby.addPlayer(socket.id, playerName);
+        players.set(socket.id, { lobbyId: lobby.id, playerName });
+
+        socket.emit("lobbyCreated", {
+            success: true,
+            lobbyId: lobby.id,
+            lobbyName: lobby.name,
+            gameMode: lobby.gameMode,
+        });
+
+        // Emit updated lobby list to all clients
+        emitLobbyList();
+    });
+
+    // Leave lobby
+    socket.on("leaveLobby", (data) => {
+        const { lobbyId } = data || {};
+        const lobby = lobbies.get(lobbyId);
+        if (!lobby) return;
+        lobby.removePlayer(socket.id);
+        socket.leave(lobbyId);
+        players.delete(socket.id);
+        io.to(lobbyId).emit("lobbyUpdate", {
+            players: Array.from(lobby.players.values()),
+            gameState: lobby.gameState,
+            gameStartTime: lobby.gameStartTime,
+            gameMode: lobby.gameMode,
+        });
+        if (lobby.players.size === 0) {
+            lobbies.delete(lobby.id);
+            emitLobbyList();
+        }
+    });
+
+    // Start game
+    socket.on("startGame", (data) => {
+        const { lobbyId } = data;
+        const lobby = lobbies.get(lobbyId);
+
+        if (lobby && lobby.hostId === socket.id && lobby.players.size >= 2) {
+            if (lobby.startGame()) {
+                io.to(lobbyId).emit("gameStarted", {
+                    gameStartTime: lobby.gameStartTime,
+                    players: Array.from(lobby.players.values()),
+                    gameMode: lobby.gameMode,
+                });
+            }
+        }
+    });
+
+    // Choose class
+    socket.on("chooseClass", (data) => {
+        const { lobbyId, className } = data;
+        const lobby = lobbies.get(lobbyId);
+        if (!lobby) return;
+        const p = lobby.players.get(socket.id);
+        if (!p) return;
+        if (!["mage", "healer", "ranged", "melee"].includes(className)) return;
+        p.chosenClass = className;
+        io.to(lobbyId).emit("lobbyUpdate", {
+            players: Array.from(lobby.players.values()),
+            gameState: lobby.gameState,
+            gameStartTime: lobby.gameStartTime,
+            gameMode: lobby.gameMode,
+        });
+    });
+
+    // Change game mode (host only)
+    socket.on("changeGameMode", (data) => {
+        const { lobbyId, gameMode } = data;
+        const lobby = lobbies.get(lobbyId);
+        if (!lobby) return;
+
+        // Only the host can change the game mode
+        if (lobby.hostId !== socket.id) return;
+
+        if (lobby.setGameMode(gameMode)) {
+            io.to(lobbyId).emit("lobbyUpdate", {
+                players: Array.from(lobby.players.values()),
+                gameState: lobby.gameState,
+                gameStartTime: lobby.gameStartTime,
+                gameMode: lobby.gameMode,
+            });
+        }
+    });
+
+    // Player movement
+    socket.on("playerMove", (data) => {
+        const { x, y } = data;
+        const playerData = players.get(socket.id);
+
+        if (playerData) {
+            const lobby = lobbies.get(playerData.lobbyId);
+            if (lobby && lobby.gameState === "playing") {
+                lobby.updatePlayerPosition(socket.id, x, y);
+
+                // Emit movement to other players
+                socket.to(playerData.lobbyId).emit("playerMoved", {
+                    playerId: socket.id,
+                    x,
+                    y,
+                });
+            }
+        }
+    });
+
+    // Player shot
+    socket.on("playerShot", (data) => {
+        const { targetX, targetY, weapon, weaponKey } = data;
+        const playerData = players.get(socket.id);
+
+        if (playerData) {
+            const lobby = lobbies.get(playerData.lobbyId);
+            if (lobby && lobby.gameState === "playing") {
+                const shooter = lobby.players.get(socket.id);
+
+                // Client-side already handles fire rate, so we don't need server-side rate limiting
+                // This prevents the "2 shots then pause" issue
+                // shooter.lastShot is still updated for other purposes but not used for rate limiting
+
+                // Special handling for melee attacks - no projectile, direct hit check
+                if (shooter && shooter.chosenClass === "melee") {
+                    // Melee attack: check for hits in melee range directly
+                    const meleeRange = 120; // 2x zombie hit range for better hit registration
+
+                    // Hit players (only in deathmatch mode)
+                    if (lobby.gameMode === "deathmatch") {
+                        lobby.players.forEach((target, targetId) => {
+                            if (targetId === socket.id) return; // Can't hit self
+
+                            const dx = target.x - shooter.x;
+                            const dy = target.y - shooter.y;
+                            const distance = Math.sqrt(dx * dx + dy * dy);
+
+                            if (distance <= meleeRange) {
+                                // Check if target is in the direction of the attack
+                                const attackAngle = Math.atan2(
+                                    targetY - shooter.y,
+                                    targetX - shooter.x
+                                );
+                                const targetAngle = Math.atan2(dy, dx);
+                                const angleDiff = Math.abs(attackAngle - targetAngle);
+
+                                // Allow some angle tolerance (about 45 degrees)
+                                if (angleDiff <= Math.PI / 4 || angleDiff >= (7 * Math.PI) / 4) {
+                                    const damage = 45; // Base melee damage
+                                    const finalDamage = target.isBlocking ?
+                                        Math.floor(damage * 0.3) :
+                                        damage;
+
+                                    target.health = Math.max(0, target.health - finalDamage);
+
+                                    // Emit hit event
+                                    io.to(playerData.lobbyId).emit("playerHit", {
+                                        shooterId: socket.id,
+                                        targetId: targetId,
+                                        newHealth: target.health,
+                                        damage: finalDamage,
+                                    });
+
+                                    // Check for death
+                                    if (target.health <= 0) {
+                                        // Award kill points for melee PvP kills (only if target wasn't already dead)
+                                        if (!target.isDead) {
+                                            shooter.kills++;
+                                            shooter.score = (shooter.score || 0) + 100; // 100 points for PvP kill
+                                            io.to(playerData.lobbyId).emit("scoreUpdate", {
+                                                playerId: socket.id,
+                                                newScore: shooter.score,
+                                            });
+                                        }
+                                        lobby.handlePlayerDeath(targetId);
+                                    }
+
+                                    // If target was blocking, charge up melee player
+                                    if (target.isBlocking) {
+                                        shooter.meleeCharge = Math.min(
+                                            100,
+                                            (shooter.meleeCharge || 0) + 20
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    // Hit zombies
+                    if (lobby.zombies) {
+                        lobby.zombies.forEach((zombie, zombieId) => {
+                            const dx = zombie.x - shooter.x;
+                            const dy = zombie.y - shooter.y;
+                            const distance = Math.sqrt(dx * dx + dy * dy);
+
+                            if (distance <= meleeRange) {
+                                // Check if zombie is in the direction of the attack
+                                const attackAngle = Math.atan2(
+                                    targetY - shooter.y,
+                                    targetX - shooter.x
+                                );
+                                const zombieAngle = Math.atan2(dy, dx);
+                                let angleDiff = Math.abs(attackAngle - zombieAngle);
+
+                                // Normalize angle difference to [0, π]
+                                if (angleDiff > Math.PI) {
+                                    angleDiff = 2 * Math.PI - angleDiff;
+                                }
+
+                                // Allow wider angle tolerance (90 degrees) for better hit registration
+                                if (angleDiff <= Math.PI / 2) {
+                                    const damage = 45; // Base melee damage
+                                    zombie.health = Math.max(0, zombie.health - damage);
+
+                                    // Award points for hitting zombie
+                                    shooter.score = (shooter.score || 0) + 1;
+                                    io.to(playerData.lobbyId).emit("scoreUpdate", {
+                                        playerId: socket.id,
+                                        newScore: shooter.score,
+                                    });
+
+                                    // If zombie dies, award bonus points and remove it
+                                    if (zombie.health <= 0) {
+                                        lobby.zombies.delete(zombieId);
+                                        shooter.score = (shooter.score || 0) + 8;
+                                        io.to(playerData.lobbyId).emit("scoreUpdate", {
+                                            playerId: socket.id,
+                                            newScore: shooter.score,
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    // Emit melee attack visual to all clients
+                    io.to(playerData.lobbyId).emit("abilityVisual", {
+                        type: "meleeAttack",
+                        x: shooter.x,
+                        y: shooter.y,
+                        angle: Math.atan2(targetY - shooter.y, targetX - shooter.x) *
+                            (180 / Math.PI),
+                        lifetime: 0.3,
+                        playerId: socket.id,
+                    });
+
+                    return; // Don't process as projectile
+                }
+
+                if (shooter && shooter.chosenClass === "mage") {
+                    // Double parallel bolts: compute slight perpendicular offset
+                    const dx = targetX - shooter.x;
+                    const dy = targetY - shooter.y;
+                    const len = Math.max(1e-6, Math.hypot(dx, dy));
+                    const nx = -dy / len; // perpendicular
+                    const ny = dx / len;
+                    const spread = 12; // pixels between parallel paths
+
+                    // Normalize weapon stats
+                    const w = normalizeWeapon(weaponKey, weapon, shooter.chosenClass);
+                    // Simulate two projectiles server-side for timing-accurate hits
+                    lobby.spawnSimulatedProjectile(
+                        socket.id,
+                        shooter.x,
+                        shooter.y,
+                        targetX + nx * spread,
+                        targetY + ny * spread,
+                        w
+                    );
+                    lobby.spawnSimulatedProjectile(
+                        socket.id,
+                        shooter.x,
+                        shooter.y,
+                        targetX - nx * spread,
+                        targetY - ny * spread,
+                        w
+                    );
+
+                    io.to(playerData.lobbyId).emit("playerShot", {
+                        playerId: socket.id,
+                        targetX: targetX + nx * spread,
+                        targetY: targetY + ny * spread,
+                        weapon,
+                        weaponKey: weaponKey || inferWeaponKeyFromClass(shooter.chosenClass),
+                    });
+                    io.to(playerData.lobbyId).emit("playerShot", {
+                        playerId: socket.id,
+                        targetX: targetX - nx * spread,
+                        targetY: targetY - ny * spread,
+                        weapon,
+                        weaponKey: weaponKey || inferWeaponKeyFromClass(shooter.chosenClass),
+                    });
+                } else {
+                    const w = normalizeWeapon(weaponKey, weapon, shooter.chosenClass);
+                    lobby.spawnSimulatedProjectile(
+                        socket.id,
+                        shooter.x,
+                        shooter.y,
+                        targetX,
+                        targetY,
+                        w
+                    );
+                    io.to(playerData.lobbyId).emit("playerShot", {
+                        playerId: socket.id,
+                        targetX,
+                        targetY,
+                        weapon,
+                        weaponKey: weaponKey || inferWeaponKeyFromClass(shooter.chosenClass),
+                    });
+                }
+            }
+        }
+    });
+
+    // Ability use (authoritative)
+    socket.on("abilityUse", (data) => {
+        const { lobbyId, type, x, y, angle } = data;
+        const lobby = lobbies.get(lobbyId);
+        if (!lobby) return;
+        const user = lobby.players.get(socket.id);
+        if (!user) return;
+
+        // Cooldown enforcement
+        const ABILITY_COOLDOWNS = {
+            healer_heal: 3000,
+            mage_slow: 8000,
+            penetrating_arrow: 4000, // 4 second cooldown for powerful penetrating arrow
+            melee_slam: 6000, // 6 second cooldown for melee slam
+        };
+        if (!user.abilityCooldowns) user.abilityCooldowns = {};
+        const now = Date.now();
+        if (ABILITY_COOLDOWNS[type]) {
+            const last = user.abilityCooldowns[type] || 0;
+            const cd = ABILITY_COOLDOWNS[type];
+            if (now - last < cd) {
+                socket.emit("abilityDenied", { type, availableAt: last + cd });
+                return;
+            }
+            user.abilityCooldowns[type] = now;
+            socket.emit("abilityCooldown", { type, availableAt: now + cd });
+        }
+
+        switch (type) {
+            case "healer_heal":
+                {
+                    // Slightly larger than a player (~1.5x typical diameter)
+                    const radius = 60; // Larger radius for better usability
+
+                    // In deathmatch mode, heal damages other players and heals self
+                    if (lobby.gameMode === "deathmatch") {
+                        lobby.players.forEach((p, pid) => {
+                            if (pid === socket.id) {
+                                // Heal self
+                                const before = p.health;
+                                p.health = Math.min(100, p.health + 20);
+                                const healed = Math.max(0, p.health - before);
+                                // No points awarded for self-healing in deathmatch
+                                io.to(lobbyId).emit("playerHealed", {
+                                    playerId: pid,
+                                    newHealth: p.health,
+                                });
+                            } else {
+                                // Damage other players
+                                const dx = p.x - x;
+                                const dy = p.y - y;
+                                if (dx * dx + dy * dy <= radius * radius) {
+                                    const damage = 25; // Healer magic damage to other players
+                                    p.health = Math.max(0, p.health - damage);
+
+                                    // No points awarded for damaging other players with heal
+
+                                    // Emit hit event for damage
+                                    io.to(lobbyId).emit("playerHit", {
+                                        shooterId: socket.id,
+                                        targetId: pid,
+                                        newHealth: p.health,
+                                        damage: damage,
+                                    });
+
+                                    // Check for death
+                                    if (p.health <= 0) {
+                                        lobby.handlePlayerDeath(pid);
+                                        // Award kill points (only if target wasn't already dead)
+                                        if (!p.isDead) {
+                                            const healer = lobby.players.get(socket.id);
+                                            if (healer) {
+                                                healer.kills++;
+                                                healer.score = (healer.score || 0) + 100; // 100 points for PvP kill
+                                                io.to(lobbyId).emit("scoreUpdate", {
+                                                    playerId: socket.id,
+                                                    newScore: healer.score,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    } else {
+                        // Survival mode: normal healing behavior
+                        lobby.players.forEach((p, pid) => {
+                            const dx = p.x - x;
+                            const dy = p.y - y;
+                            if (dx * dx + dy * dy <= radius * radius) {
+                                const before = p.health;
+                                p.health = Math.min(100, p.health + 20);
+                                // Award healer points for effective healing (balanced)
+                                const healed = Math.max(0, p.health - before);
+                                if (healed > 0) {
+                                    const healer = lobby.players.get(socket.id);
+                                    if (healer) {
+                                        healer.score = (healer.score || 0) + Math.ceil(healed / 4); // Reduced healing points
+                                        io.to(lobbyId).emit("scoreUpdate", {
+                                            playerId: socket.id,
+                                            newScore: healer.score,
+                                        });
+                                    }
+                                }
+                                io.to(lobbyId).emit("playerHealed", {
+                                    playerId: pid,
+                                    newHealth: p.health,
+                                });
+                            }
+                        });
+                    }
+
+                    // Damage zombies (healer magic hurts undead)
+                    let zombiesDamaged = 0;
+                    const zombieDamage = 45; // Magic damage to zombies
+                    if (lobby.zombies) {
+                        lobby.zombies.forEach((z, zid) => {
+                            const dx = z.x - x;
+                            const dy = z.y - y;
+                            if (dx * dx + dy * dy <= radius * radius) {
+                                z.health = Math.max(0, z.health - zombieDamage);
+                                zombiesDamaged++;
+
+                                // Award points for hitting zombie with heal
+                                const healer = lobby.players.get(socket.id);
+                                if (healer) {
+                                    healer.score = (healer.score || 0) + 2;
+                                    io.to(lobbyId).emit("scoreUpdate", {
+                                        playerId: socket.id,
+                                        newScore: healer.score,
+                                    });
+                                }
+
+                                // If zombie dies, award bonus points and remove it
+                                if (z.health <= 0) {
+                                    lobby.zombies.delete(zid);
+                                    if (healer) {
+                                        healer.score = (healer.score || 0) + 10;
+                                        io.to(lobbyId).emit("scoreUpdate", {
+                                            playerId: socket.id,
+                                            newScore: healer.score,
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    if (zombiesDamaged > 0) {
+                        console.log(`Healer magic damaged ${zombiesDamaged} zombies`);
+                    }
+
+                    // Broadcast visual to all clients so everyone sees the AoE
+                    io.to(lobbyId).emit("abilityVisual", {
+                        type: "heal",
+                        x,
+                        y,
+                        radius,
+                        lifetime: 0.5,
+                    });
+                    break;
+                }
+            case "mage_slow":
+                {
+                    const radius = 80; // Larger radius to make it easier to hit zombies
+                    const duration = 5000; // 5 seconds persistent area
+
+                    // Create persistent slow area effect
+                    const effectId = `slow-${Date.now()}-${Math.random()}`;
+                    lobby.areaEffects.set(effectId, {
+                        type: "slow",
+                        x: x,
+                        y: y,
+                        radius: radius,
+                        casterId: socket.id,
+                        createdAt: Date.now(),
+                        expiresAt: Date.now() + duration,
+                    });
+
+                    console.log(
+                        `Created persistent slow area at (${x}, ${y}) for ${duration}ms`
+                    );
+
+                    // In deathmatch mode, also apply slow to other players
+                    if (lobby.gameMode === "deathmatch") {
+                        lobby.players.forEach((p, pid) => {
+                            if (pid !== socket.id) { // Don't slow self
+                                const dx = p.x - x;
+                                const dy = p.y - y;
+                                if (dx * dx + dy * dy <= radius * radius) {
+                                    // Apply slow effect to other players
+                                    p.slowUntil = Date.now() + duration;
+                                    io.to(lobbyId).emit("applySlow", {
+                                        playerId: pid,
+                                        duration: duration,
+                                    });
+
+                                    // No points awarded for slowing other players
+                                }
+                            }
+                        });
+                    }
+
+                    // Broadcast area visual with longer lifetime to match persistent effect
+                    io.to(lobbyId).emit("abilityVisual", {
+                        type: "slow",
+                        x,
+                        y,
+                        radius,
+                        lifetime: duration / 1000, // Convert to seconds for client
+                    });
+                    break;
+                }
+            case "penetrating_arrow":
+                {
+                    const { x: targetX, y: targetY } = data;
+                    if (typeof targetX !== "number" || typeof targetY !== "number") return;
+
+                    // Create a large, slow penetrating arrow projectile
+                    const arrowId = `penetrating-${Date.now()}-${Math.random()}`;
+                    const dx = targetX - user.x;
+                    const dy = targetY - user.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+
+                    if (distance === 0) return; // Can't shoot at self
+
+                    const angle = Math.atan2(dy, dx);
+                    const speed = 1000; // 2.5x faster than before (was 400, now 1000)
+                    const damage = 60; // Higher damage than regular arrows (regular is 40)
+                    const projectileSize = 8; // Skinnier than before, but still bigger than regular arrows (regular is 4)
+
+                    const penetratingArrow = {
+                        id: arrowId,
+                        x: user.x,
+                        y: user.y,
+                        vx: Math.cos(angle) * speed,
+                        vy: Math.sin(angle) * speed,
+                        speed: speed,
+                        damage: damage,
+                        size: projectileSize,
+                        ttl: 5.0, // 5 seconds lifetime
+                        ownerId: socket.id, // Use ownerId to match collision detection
+                        penetrating: true, // Special flag for penetrating projectiles
+                        hitTargets: new Set(), // Track what this arrow has already hit
+                        color: "#ff6b00", // Orange color for special arrow
+                    };
+
+                    // Add to simulated projectiles for collision detection
+                    if (!lobby.simProjectiles) lobby.simProjectiles = new Map();
+                    lobby.simProjectiles.set(arrowId, penetratingArrow);
+
+                    // Broadcast the special projectile to all clients for visual
+                    io.to(lobbyId).emit("projectileCreate", {
+                        id: arrowId,
+                        x: user.x,
+                        y: user.y,
+                        vx: penetratingArrow.vx,
+                        vy: penetratingArrow.vy,
+                        size: projectileSize,
+                        color: "#ff6b00",
+                        playerId: socket.id,
+                        penetrating: true, // Let clients know this is special
+                    });
+
+                    console.log(
+                        `Created penetrating arrow ${arrowId} from player ${socket.id} towards (${targetX}, ${targetY})`
+                    );
+                    break;
+                }
+            case "melee_slam":
+                {
+                    const radius = 150; // Even larger radius for area knockback
+                    const strength = 800; // Massive knockback force (same as range distance)
+                    const damage = 45; // Slightly higher damage
+
+                    // Affect players (only in deathmatch mode)
+                    if (lobby.gameMode === "deathmatch") {
+                        lobby.players.forEach((p, pid) => {
+                            if (pid === socket.id) return;
+                            const dx = p.x - user.x;
+                            const dy = p.y - user.y;
+                            const d2 = dx * dx + dy * dy;
+                            if (d2 <= radius * radius && d2 > 0) {
+                                const dist = Math.sqrt(d2);
+                                const nx = dx / dist;
+                                const ny = dy / dist;
+                                io.to(lobbyId).emit("applyKnockback", {
+                                    playerId: pid,
+                                    vx: nx * strength,
+                                    vy: ny * strength,
+                                });
+                                // Apply damage
+                                p.health = Math.max(0, p.health - damage);
+                                io.to(lobbyId).emit("playerHit", {
+                                    shooterId: socket.id,
+                                    targetId: pid,
+                                    newHealth: p.health,
+                                    damage,
+                                });
+
+                                // Check for death
+                                if (p.health <= 0) {
+                                    lobby.handlePlayerDeath(pid);
+                                    // Award kill points (only if target wasn't already dead)
+                                    if (!p.isDead) {
+                                        const slammer = lobby.players.get(socket.id);
+                                        if (slammer) {
+                                            slammer.kills++;
+                                            slammer.score = (slammer.score || 0) + 100; // 100 points for PvP kill
+                                            io.to(lobbyId).emit("scoreUpdate", {
+                                                playerId: socket.id,
+                                                newScore: slammer.score,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    // Affect zombies
+                    if (lobby.zombies) {
+                        lobby.zombies.forEach((z, zid) => {
+                            const dx = z.x - user.x;
+                            const dy = z.y - user.y;
+                            const d2 = dx * dx + dy * dy;
+                            if (d2 <= radius * radius && d2 > 0) {
+                                // Apply damage to zombie
+                                z.health = Math.max(0, z.health - damage);
+
+                                // Apply knockback to zombie
+                                const dist = Math.sqrt(d2);
+                                const nx = dx / dist;
+                                const ny = dy / dist;
+                                const zombieKnockback = strength * 0.6; // Zombies get 60% of player knockback
+
+                                // Apply knockback velocity to zombie
+                                z.vx = nx * zombieKnockback;
+                                z.vy = ny * zombieKnockback;
+
+                                // Add a small delay before zombie can move again (stunned effect)
+                                z.stunnedUntil = Date.now() + 500; // 0.5 second stun
+
+                                // Award points for hitting zombie
+                                const shooter = lobby.players.get(socket.id);
+                                if (shooter) {
+                                    shooter.score = (shooter.score || 0) + 2; // Points for ability hit
+                                    io.to(lobbyId).emit("scoreUpdate", {
+                                        playerId: socket.id,
+                                        newScore: shooter.score,
+                                    });
+                                }
+
+                                // If zombie dies, award bonus points and remove it
+                                if (z.health <= 0) {
+                                    lobby.zombies.delete(zid);
+                                    if (shooter) {
+                                        shooter.score = (shooter.score || 0) + 12; // Bonus for kill with ability
+                                        io.to(lobbyId).emit("scoreUpdate", {
+                                            playerId: socket.id,
+                                            newScore: shooter.score,
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    // Broadcast slam visual around the user
+                    io.to(lobbyId).emit("abilityVisual", {
+                        type: "slam",
+                        x: user.x,
+                        y: user.y,
+                        playerId: socket.id,
+                        radius,
+                        lifetime: 0.4, // Slightly longer visual for bigger impact
+                    });
+                    break;
+                }
+        }
+    });
+
+    // Pause/Resume clients (server tracks pause state to stop updates)
+    socket.on("togglePause", (data) => {
+        const { lobbyId } = data;
+        const playerData = players.get(socket.id);
+        if (!playerData) return;
+        const lobby = lobbies.get(lobbyId);
+        if (!lobby) return;
+
+        // Only allow host or any player to pause/resume during game
+        if (lobby.gameState !== "playing") return;
+
+        lobby.clientPaused = !lobby.clientPaused;
+        if (lobby.clientPaused) {
+            io.to(lobbyId).emit("gamePaused", { pausedBy: playerData.playerName });
+        } else {
+            io.to(lobbyId).emit("gameResumed", { resumedBy: playerData.playerName });
+            // Reset timing anchors to avoid a jump
+            lobby.lastUpdate = Date.now();
+        }
+    });
+
+    // Quit game
+    socket.on("quitGame", (data) => {
+        const { lobbyId } = data;
+        const lobby = lobbies.get(lobbyId);
+        const playerData = players.get(socket.id);
+
+        if (lobby && lobby.gameState === "playing" && playerData) {
+            io.to(lobbyId).emit("gameQuit", {
+                quitBy: playerData.playerName,
+            });
+
+            // End game
+            lobby.endGame();
+        }
+    });
+
+    // Restart game
+    socket.on("restartGame", (data) => {
+        const { lobbyId } = data;
+        const lobby = lobbies.get(lobbyId);
+        const playerData = players.get(socket.id);
+
+        if (lobby && playerData) {
+            console.log(`Player ${playerData.playerName} requested game restart`);
+
+            // Reset the lobby to waiting state immediately
+            lobby.gameState = "waiting";
+            lobby.gameStartTime = null;
+
+            // Clear all game data
+            if (lobby.zombies) lobby.zombies.clear();
+            if (lobby.simProjectiles) lobby.simProjectiles.clear();
+            if (lobby.areaEffects) lobby.areaEffects.clear();
+
+            // Stop any running game timers
+            if (lobby.gameTimer) {
+                clearTimeout(lobby.gameTimer);
+                lobby.gameTimer = null;
+            }
+            if (lobby.waveInterval) {
+                clearInterval(lobby.waveInterval);
+                lobby.waveInterval = null;
+            }
+            if (lobby.waveCountdownTimeout) {
+                clearTimeout(lobby.waveCountdownTimeout);
+                lobby.waveCountdownTimeout = null;
+            }
+
+            // Reset player states
+            lobby.players.forEach((player, playerId) => {
+                player.health = 100;
+                player.score = 0;
+                player.kills = 0;
+                player.deaths = 0;
+                player.lives = 3;
+                player.isDead = false;
+                player.respawnTime = 0;
+                player.lastShot = 0;
+                player.meleeCharge = 0;
+                player.isInvulnerable = false;
+                player.slowUntil = 0;
+                player.abilityCooldowns = {};
+            });
+
+            // Emit updated lobby state
+            io.to(lobbyId).emit("lobbyUpdate", {
+                players: Array.from(lobby.players.values()),
+                gameState: lobby.gameState,
+                gameStartTime: lobby.gameStartTime,
+                gameMode: lobby.gameMode,
+            });
+
+            console.log(`Game restarted for lobby ${lobbyId}`);
+        }
+    });
+
+    // Get lobby list
+    socket.on("getLobbies", () => {
+        emitLobbyList();
+    });
+
+    // Disconnect
+    socket.on("disconnect", () => {
+        console.log("User disconnected:", socket.id);
+
+        const playerData = players.get(socket.id);
+        if (playerData) {
+            const lobby = lobbies.get(playerData.lobbyId);
+            if (lobby) {
+                lobby.removePlayer(socket.id);
+
+                // Emit updated lobby info
+                io.to(playerData.lobbyId).emit("lobbyUpdate", {
+                    players: Array.from(lobby.players.values()),
+                    gameState: lobby.gameState,
+                    gameStartTime: lobby.gameStartTime,
+                    gameMode: lobby.gameMode,
+                });
+
+                // Remove lobby if empty
+                if (lobby.players.size === 0) {
+                    lobbies.delete(lobby.id);
+                    emitLobbyList();
+                }
+            }
+
+            players.delete(socket.id);
+        }
+    });
+});
+
+// Helper function to emit lobby list
+function emitLobbyList() {
+    const lobbyList = Array.from(lobbies.values()).map((lobby) => ({
+        id: lobby.id,
+        name: lobby.name,
+        playerCount: lobby.players.size,
+        maxPlayers: lobby.maxPlayers,
+        gameState: lobby.gameState,
+        gameMode: lobby.gameMode,
+    }));
+
+    io.emit("lobbyList", lobbyList);
+}
+
+// Start server
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+});
