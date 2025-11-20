@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Multiplayer Shooter</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+
+<body>
+    <div id="app">
+        <!-- Home Page -->
+        <div id="homePage" class="page active">
+            <div class="container">
+                <h1>Multiplayer Shooter</h1>
+                <p>Enter your name to start playing!</p>
+
+                <div class="input-group">
+                    <input type="text" id="playerName" placeholder="Enter your name" maxlength="20" />
+                    <button id="createLobbyBtn" class="btn btn-primary">
+              Create New Lobby
+            </button>
+                </div>
+
+                <div class="lobbies-section">
+                    <h3>Available Lobbies</h3>
+                    <div id="lobbiesList" class="lobbies-grid">
+                        <!-- Lobbies will be populated here -->
+                    </div>
+                    <button id="refreshLobbiesBtn" class="btn btn-secondary">
+              Refresh Lobbies
+            </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Lobby Page -->
+        <div id="lobbyPage" class="page">
+            <div class="container">
+                <h2 id="lobbyName">Lobby</h2>
+                <div class="lobby-info">
+                    <p>Status: <span id="lobbyStatus">Waiting for players...</span></p>
+                    <p>Players: <span id="playerCount">0/4</span></p>
+                    <p>Game Mode: <span id="gameModeDisplay" class="game-mode-display">Survival</span></p>
+                </div>
+
+                <div class="game-mode-select" id="gameModeSelect">
+                    <h3>Select Game Mode</h3>
+                    <div class="game-mode-grid">
+                        <div class="game-mode-card" data-mode="survival">
+                            <h4>Survival</h4>
+                            <p>Fight waves of zombies together</p>
+                        </div>
+                        <div class="game-mode-card" data-mode="deathmatch">
+                            <h4>Deathmatch</h4>
+                            <p>PvP combat</p>
+                        </div>
+                    </div>
+                    <p id="gameModeStatus">Current: Survival</p>
+                </div>
+
+                <div class="class-select">
+                    <h3>Select Your Class</h3>
+                    <div class="class-grid">
+                        <div class="class-card" data-class="mage">
+                            <h4>Mage</h4>
+                            <p>2 bolts, area slow</p>
+                        </div>
+                        <div class="class-card" data-class="healer">
+                            <h4>Healer</h4>
+                            <p>Slow bolt, AoE heal</p>
+                        </div>
+                        <div class="class-card" data-class="ranged">
+                            <h4>Ranged</h4>
+                            <p>Arrow shot, bow swing</p>
+                        </div>
+                        <div class="class-card" data-class="melee">
+                            <h4>Melee</h4>
+                            <p>Heavy strike, block</p>
+                        </div>
+                    </div>
+                    <p id="classStatus">No class selected</p>
+                </div>
+
+                <div class="players-list">
+                    <h3>Players</h3>
+                    <div id="playersList">
+                        <!-- Players will be listed here -->
+                    </div>
+                </div>
+
+                <div class="lobby-actions">
+                    <button id="startGameBtn" class="btn btn-primary" disabled>
+              Start Game
+            </button>
+                    <button id="leaveLobbyBtn" class="btn btn-danger">
+              Leave Lobby
+            </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Game Page -->
+        <div id="gamePage" class="page">
+            <div class="game-container">
+                <!-- Game UI -->
+                <div class="game-ui">
+                    <div class="top-bar">
+                        <div class="game-info">
+                            <span id="waveCounter">Wave: 1</span>
+                            <span id="gameTimer">0:00</span>
+                            <span id="livesCounter">❤️ 3</span>
+                            <span id="gameStatus">Playing</span>
+                        </div>
+                        <div class="menu-buttons">
+                            <button id="pauseBtn" class="btn btn-secondary">Pause</button>
+                            <button id="restartGameBtnMain" class="btn btn-warning">Restart</button>
+                            <button id="quitBtn" class="btn btn-danger">Quit</button>
+                        </div>
+                    </div>
+
+                    <!-- FPS Counter -->
+                    <div id="fpsCounter">FPS: 60</div>
+
+                    <div class="scoreboard">
+                        <div id="scoreboardContent">
+                            <!-- Scoreboard will be populated here -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Game Area -->
+                <div id="gameArea" class="game-area">
+                    <!-- Players and game objects will be rendered here -->
+                </div>
+
+                <!-- Game Menu Overlay -->
+                <div id="gameMenu" class="game-menu-overlay hidden">
+                    <div class="game-menu">
+                        <h3 id="menuTitle">Game Paused</h3>
+                        <p id="menuMessage">The game has been paused</p>
+                        <div class="menu-buttons">
+                            <button id="resumeBtn" class="btn btn-primary">Resume</button>
+                            <button id="quitGameBtn" class="btn btn-danger">
+                  Quit Game
+                </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Game End Overlay -->
+                <div id="gameEndOverlay" class="game-end-overlay hidden">
+                    <div class="game-end">
+                        <h3>Game Over!</h3>
+                        <div id="winnerInfo">
+                            <!-- Winner information will be displayed here -->
+                        </div>
+                        <div class="final-scores">
+                            <h4>Final Scores</h4>
+                            <div id="finalScoresList">
+                                <!-- Final scores will be displayed here -->
+                            </div>
+                        </div>
+                        <div class="menu-buttons">
+                            <button id="backToLobbyBtn" class="btn btn-primary">
+                                Back to Lobby
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div id="loadingOverlay" class="loading-overlay hidden">
+        <div class="loading-spinner"></div>
+        <p>Loading...</p>
+    </div>
+
+    <!-- Error Modal -->
+    <div id="errorModal" class="modal hidden">
+        <div class="modal-content">
+            <h3>Error</h3>
+            <p id="errorMessage"></p>
+            <button id="errorCloseBtn" class="btn btn-primary">OK</button>
+        </div>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="js/weapons.js"></script>
+    <script src="js/player.js"></script>
+    <!-- System components -->
+    <script src="js/engine/systems/SoundManager.js"></script>
+    <script src="js/engine/systems/Physics.js"></script>
+    <script src="js/engine/systems/Camera.js"></script>
+    <script src="js/engine/systems/PlayerManager.js"></script>
+    <script src="js/engine/systems/ProjectileManager.js"></script>
+    <script src="js/engine/systems/EffectManager.js"></script>
+    <script src="js/engine/systems/InputHandler.js"></script>
+    <script src="js/engine/systems/WeaponSystem.js"></script>
+    <script src="js/engine/systems/AbilitySystem.js"></script>
+    <script src="js/engine/systems/GameStateManager.js"></script>
+    <script src="js/engine/systems/GameStatusManager.js"></script>
+    <script src="js/engine/systems/PlayerLifecycleManager.js"></script>
+    <script src="js/engine/systems/NetworkManager.js"></script>
+    <script src="js/engine/systems/GameLoop.js"></script>
+    <!-- Renderer components -->
+    <script src="js/renderer/entities/WallRenderer.js"></script>
+    <script src="js/renderer/entities/NPCRenderer.js"></script>
+    <script src="js/renderer/entities/ZombieRenderer.js"></script>
+    <script src="js/renderer/entities/ProjectileTrailRenderer.js"></script>
+    <script src="js/renderer/entities/ProjectileRenderer.js"></script>
+    <script src="js/renderer/entities/PlayerRenderer.js"></script>
+    <script src="js/renderer/effects/EffectRenderer.js"></script>
+    <script src="js/renderer/ui/UIRenderer.js"></script>
+    <script src="js/renderer/gameRenderer.js"></script>
+    <script src="js/engine/game.js"></script>
+    <script src="js/main.js"></script>
+
+
+</body>
+
+</html>

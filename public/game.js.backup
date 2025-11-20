@@ -1,0 +1,2940 @@
+// Game Engine
+class GameEngine {
+    constructor(gameArea, socket, gameMode = "survival", initialGameStartTime = null) {
+        this.gameArea = gameArea;
+        this.socket = socket;
+        this.gameMode = gameMode;
+        this.isRunning = false;
+        this.isPaused = false;
+        this.lastTime = 0;
+        this.deltaTime = 0;
+        this.fps = 0;
+        this.frameCount = 0;
+        this.lastFpsUpdate = 0;
+
+        // Game state
+        this.players = new Map();
+        this.projectiles = new Map();
+        this.effects = new Map();
+        this.walls = [];
+        this.localPlayerId = null;
+        this.gameStartTime = initialGameStartTime;
+        this.gameDuration = 900000; // 15 minutes (will be adjusted per game mode)
+
+        // Set game duration based on game mode
+        if (this.gameMode === "survival") {
+            this.gameDuration = 900000; // 15 minutes for survival
+        } else {
+            this.gameDuration = 300000; // 5 minutes for deathmatch
+        }
+
+        // Input handling
+        this.keys = new Set();
+        this.mouseX = 0;
+        this.mouseY = 0;
+        this.isMouseDown = false;
+        this.isLeftMouseDown = false;
+        this.isRightMouseDown = false;
+
+        // Rendering
+        this.renderer = new GameRenderer(gameArea);
+        this.renderer.gameEngine = this; // Set reference for effect rendering
+        this.camera = { x: 0, y: 0, zoom: 1 };
+        // Fixed world size so map stays the same regardless of browser size
+        this.worldWidth = 1200;
+        this.worldHeight = 800;
+        this.scale = 1; // CSS scale applied to gameArea for responsive fit
+
+        // Sound system
+        this.soundManager = new SoundManager();
+
+        // Initialize
+        this.init();
+    }
+
+    init() {
+        this.setupEventListeners();
+        this.setupSocketListeners();
+        this.startGameLoop();
+
+
+
+        // Initialize some walls (based on fixed world size)
+        // Lock game area to fixed world size so map is consistent and scale to fit viewport
+        if (this.gameArea) {
+            this.gameArea.style.width = `${this.worldWidth}px`;
+            this.gameArea.style.height = `${this.worldHeight}px`;
+            this.gameArea.style.position = "absolute";
+            this.gameArea.style.transformOrigin = "top left";
+            const parent = this.gameArea.parentElement;
+            if (parent) {
+                parent.style.position = parent.style.position || "relative";
+                parent.style.width = "100vw";
+                parent.style.height = "100vh";
+                parent.style.overflow = "hidden";
+            }
+            this.updateScale();
+            window.addEventListener("resize", () => this.updateScale());
+        }
+        this.buildDefaultWalls();
+        // Remove debug helpers if present
+        this.gameArea.style.border = "";
+    }
+
+    buildDefaultWalls() {
+        const W = this.worldWidth;
+        const H = this.worldHeight;
+        const wallThickness = Math.max(16, Math.floor(Math.min(W, H) * 0.015));
+
+        // Keep only 3 interior cover walls, no perimeter blockers
+        this.walls = [
+            // Horizontal cover near top-left quadrant
+            { x: W * 0.18, y: H * 0.22, w: W * 0.24, h: wallThickness },
+            // Vertical cover around center-right (not in exact center)
+            { x: W * 0.62, y: H * 0.38, w: wallThickness, h: H * 0.26 },
+            // Horizontal cover near bottom-left quadrant
+            { x: W * 0.25, y: H * 0.72, w: W * 0.3, h: wallThickness },
+        ];
+    }
+
+    setupEventListeners() {
+        // Keyboard events
+        document.addEventListener("keydown", (e) => {
+            // Prevent page scroll on arrow keys/space while playing
+            if (
+                ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(e.key)
+            ) {
+                e.preventDefault();
+            }
+            this.keys.add(e.key.toLowerCase());
+            // Reduced logging for performance
+            // console.log(`Key pressed: ${e.key}, Keys: ${Array.from(this.keys).join(", ")}`);
+
+            // Weapon switching
+            if (e.key >= "1" && e.key <= "9") {
+                const weaponIndex = parseInt(e.key) - 1;
+                const weaponNames = Object.keys(WEAPON_VISUALS);
+                if (weaponIndex < weaponNames.length) {
+                    this.switchWeapon(weaponNames[weaponIndex]);
+                }
+            }
+
+            // Reload
+            if (e.key === "r") {
+                this.reloadWeapon();
+            }
+
+            // Abilities
+            if (e.key === "q") {
+                this.useAbility("speedBoost");
+            }
+            if (e.key === "e") {
+                this.useAbility("shield");
+            }
+            if (e.key === "f") {
+                this.useAbility("teleport");
+            }
+            if (e.key === "g") {
+                this.useAbility("healthRegen");
+            }
+            if (e.key === "h") {
+                this.useAbility("weaponSwap");
+            }
+        });
+
+        document.addEventListener("keyup", (e) => {
+            this.keys.delete(e.key.toLowerCase());
+        });
+
+        // Mouse events
+        this.gameArea.addEventListener("mousemove", (e) => {
+            const rect = this.gameArea.getBoundingClientRect();
+            // Account for CSS scale to map back to world-space coordinates
+            const localX = (e.clientX - rect.left) / (this.scale || 1);
+            const localY = (e.clientY - rect.top) / (this.scale || 1);
+            // Screen-space inside game area (unscaled)
+            this.mouseX = localX;
+            this.mouseY = localY;
+            // Convert to world-space using camera
+            this.mouseWorldX = this.camera.x + this.mouseX;
+            this.mouseWorldY = this.camera.y + this.mouseY;
+
+            // Mouse movement is now only used for aiming, not for shooting
+            // Continuous shooting is handled by the timer in startShooting()
+
+            // Reduced logging for performance
+            // console.log(`Mouse screen: (${this.mouseX}, ${this.mouseY}) world: (${this.mouseWorldX}, ${this.mouseWorldY})`);
+        });
+
+        this.gameArea.addEventListener("mousedown", (e) => {
+            if (e.button === 0) {
+                this.isLeftMouseDown = true;
+                this.isMouseDown = true;
+            }
+            if (e.button === 2) {
+                this.isRightMouseDown = true;
+                this.isMouseDown = true;
+                // Right click abilities per class
+                const me = this.players.get(this.localPlayerId);
+                if (me) {
+                    switch (me.className) {
+                        case "healer":
+                            // server-authoritative heal
+                            if (this.currentLobbyId) {
+                                this.socket.emit("abilityUse", {
+                                    lobbyId: this.currentLobbyId,
+                                    type: "healer_heal",
+                                    x: this.mouseWorldX,
+                                    y: this.mouseWorldY,
+                                });
+                            }
+                            break;
+                        case "mage":
+                            // server-authoritative slow
+                            if (this.currentLobbyId) {
+                                this.socket.emit("abilityUse", {
+                                    lobbyId: this.currentLobbyId,
+                                    type: "mage_slow",
+                                    x: this.mouseWorldX,
+                                    y: this.mouseWorldY,
+                                });
+                            }
+                            break;
+                        case "ranged":
+                            // server-authoritative penetrating arrow
+                            if (this.currentLobbyId) {
+                                this.socket.emit("abilityUse", {
+                                    lobbyId: this.currentLobbyId,
+                                    type: "penetrating_arrow",
+                                    x: this.mouseWorldX,
+                                    y: this.mouseWorldY,
+                                });
+                            }
+                            break;
+                        case "melee":
+                            // Knockback slam ability
+                            if (this.currentLobbyId) {
+                                this.socket.emit("abilityUse", {
+                                    lobbyId: this.currentLobbyId,
+                                    type: "melee_slam",
+                                    x: this.mouseWorldX,
+                                    y: this.mouseWorldY,
+                                });
+                            }
+                            break;
+                    }
+                }
+            }
+            // Start or continue shooting only for left click
+            if (e.button === 0) {
+                this.startShooting();
+            }
+        });
+
+        this.gameArea.addEventListener("mouseup", (e) => {
+            if (e.button === 0) {
+                this.isLeftMouseDown = false;
+            }
+            if (e.button === 2) {
+                this.isRightMouseDown = false;
+                // Right click released - no special handling needed for melee slam
+            }
+            // Only stop shooting when left button is released
+            if (e.button === 0) {
+                this.stopShooting();
+            }
+        });
+
+        // Context menu prevention
+        this.gameArea.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+        });
+
+        // Window focus events
+        window.addEventListener("focus", () => {
+            this.keys.clear();
+        });
+
+        window.addEventListener("blur", () => {
+            this.keys.clear();
+        });
+
+        // Prevent arrow keys from scrolling while focused anywhere
+        window.addEventListener(
+            "keydown",
+            (e) => {
+                if (
+                    ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(
+                        e.key
+                    )
+                ) {
+                    e.preventDefault();
+                }
+            }, { passive: false }
+        );
+    }
+
+    setupSocketListeners() {
+        // Game started - handled by main.js, which creates this GameEngine instance
+        // Players are initialized when the GameEngine is created
+
+        // Player joined
+        this.socket.on("lobbyUpdate", (data) => {
+            this.updateLobbyInfo(data);
+        });
+
+        // Player moved
+        this.socket.on("playerMoved", (data) => {
+            const player = this.players.get(data.playerId);
+            if (player && player.id !== this.localPlayerId) {
+                player.x = data.x;
+                player.y = data.y;
+            }
+        });
+
+        // Player shot (recreate projectile on clients)
+        this.socket.on("playerShot", (data) => {
+            if (data.playerId !== this.localPlayerId) {
+                const shooter = this.players.get(data.playerId);
+                if (!shooter) return;
+                const weapon = WEAPONS[data.weaponKey] || WEAPONS.pistol;
+                const projectile = weapon.createProjectile(
+                    shooter.x,
+                    shooter.y,
+                    data.targetX,
+                    data.targetY,
+                    data.playerId
+                );
+                // Damage boost is server-side only; visuals identical here
+                this.addProjectile(projectile);
+            }
+        });
+
+        // Player hit
+        this.socket.on("playerHit", (data) => {
+            console.log("Client: Received playerHit socket event:", data); // Debug log
+            this.handlePlayerHit(data);
+        });
+
+        // Ability result visuals
+        this.socket.on("playerHealed", (data) => {
+            const target = this.players.get(data.playerId);
+            if (target) {
+                target.health = data.newHealth;
+                this.addEffect({
+                    id: `heal-${Date.now()}`,
+                    x: target.x,
+                    y: target.y,
+                    type: "heal",
+                    lifetime: 0.5,
+                    maxLifetime: 0.5,
+                });
+            }
+        });
+        // Ability cooldown updates (per client)
+        this.socket.on("abilityCooldown", (data) => {
+            // data: { type, availableAt }
+            if (!this.abilityCooldowns) this.abilityCooldowns = new Map();
+            if (data && data.type) {
+                this.abilityCooldowns.set(data.type, data.availableAt || Date.now());
+            }
+        });
+        this.socket.on("abilityDenied", (data) => {
+            // Optionally show feedback; for now just store cooldown if provided
+            if (!this.abilityCooldowns) this.abilityCooldowns = new Map();
+            if (data && data.type && data.availableAt) {
+                this.abilityCooldowns.set(data.type, data.availableAt);
+            }
+        });
+        this.socket.on("applySlow", (data) => {
+            const target = this.players.get(data.playerId);
+            if (target) {
+                // apply local slow timer for movement reduction
+                target.slowUntil = Date.now() + (data.duration || 0);
+                // client visual marker
+                this.addEffect({
+                    id: `slow-${Date.now()}`,
+                    x: target.x,
+                    y: target.y,
+                    type: "speed",
+                    lifetime: 1.0,
+                    maxLifetime: 1.0,
+                });
+            }
+        });
+
+        // Handle player slowed by boss mob
+        this.socket.on("playerSlowed", (data) => {
+            const target = this.players.get(data.playerId);
+            if (target) {
+                // apply local slow timer for movement reduction
+                target.slowUntil = Date.now() + (data.duration || 0);
+                // client visual marker
+                this.addEffect({
+                    id: `slow-${Date.now()}`,
+                    x: target.x,
+                    y: target.y,
+                    type: "speed",
+                    lifetime: 1.0,
+                    maxLifetime: 1.0,
+                });
+            }
+        });
+        this.socket.on("applyKnockback", (data) => {
+            const target = this.players.get(data.playerId);
+            if (target) {
+                target.vx += data.vx;
+                target.vy += data.vy;
+                this.addEffect({
+                    id: `kb-${Date.now()}`,
+                    x: target.x,
+                    y: target.y,
+                    type: "explosion",
+                    radius: 35,
+                    lifetime: 0.15,
+                    maxLifetime: 0.15,
+                });
+            }
+        });
+        // Ability area visuals (always show)
+        this.socket.on("abilityVisual", (data) => {
+            const { type, x, y, radius, lifetime, playerId, angle } = data || {};
+            if (type === "swing" && playerId) {
+                const ply = this.players.get(playerId);
+                if (!ply) return;
+                const id = `swing-${Date.now()}`;
+                this.effects.set(id, {
+                    x: ply.x,
+                    y: ply.y,
+                    type: "explosion",
+                    radius: radius || 60,
+                    lifetime: lifetime || 0.2,
+                    maxLifetime: lifetime || 0.2,
+                    followPlayerId: playerId,
+                });
+                return;
+            }
+            if (type === "slam" && playerId) {
+                const ply = this.players.get(playerId);
+                if (!ply) return;
+                const id = `slam-${Date.now()}`;
+                this.effects.set(id, {
+                    x: ply.x,
+                    y: ply.y,
+                    type: "slam",
+                    radius: radius || 100,
+                    lifetime: lifetime || 0.3,
+                    maxLifetime: lifetime || 0.3,
+                    followPlayerId: playerId,
+                });
+                return;
+            }
+            if (type === "meleeAttack" && playerId) {
+                const ply = this.players.get(playerId);
+                if (!ply) return;
+                const id = `meleeAttack-${Date.now()}`;
+                this.effects.set(id, {
+                    x: ply.x,
+                    y: ply.y,
+                    type: "meleeAttack",
+                    angle: typeof angle === "number" ? angle : 0,
+                    lifetime: lifetime || 0.3,
+                    maxLifetime: lifetime || 0.3,
+                    followPlayerId: playerId,
+                });
+                return;
+            }
+            if (type === "blockStart" && playerId) {
+                const ply = this.players.get(playerId);
+                if (!ply) return;
+                const id = `block-${playerId}`;
+                this.effects.set(id, {
+                    x: ply.x,
+                    y: ply.y,
+                    type: "block",
+                    angle: typeof angle === "number" ? angle : 0,
+                    lifetime: 9999,
+                    maxLifetime: 9999,
+                    followPlayerId: playerId,
+                });
+                return;
+            }
+            if (type === "blockEnd" && playerId) {
+                const id = `block-${playerId}`;
+                if (this.effects.has(id)) this.effects.delete(id);
+                return;
+            }
+            this.addEffect({
+                id: `${type}-${Date.now()}`,
+                x,
+                y,
+                type: type === "heal" ? "heal" : type === "slow" ? "speed" : "explosion",
+                radius: radius || 30,
+                lifetime: lifetime || 0.5,
+                maxLifetime: lifetime || 0.5,
+            });
+        });
+
+        // NPC updates
+        this.socket.on("npcState", () => {
+            // Deprecated: replaced by zombies
+        });
+        this.socket.on("npcShot", (data) => {
+            // Also create a short-lived effect for muzzle flash
+            if (!data) return;
+            const id = `npc-beam-${Date.now()}`;
+            this.effects.set(id, {
+                x: data.fromX,
+                y: data.fromY,
+                type: "speed",
+                radius: 40,
+                lifetime: 0.15,
+                maxLifetime: 0.15,
+            });
+        });
+        this.socket.on("npcProjectile", () => {});
+
+        // Projectile removal on impact (server-authoritative)
+        this.socket.on("projectileHit", (data) => {
+            if (!data) return;
+            const { shooterId, hitX, hitY, penetrating } = data;
+
+            // For penetrating projectiles, don't remove them
+            if (penetrating) {
+                // Create hit effect but keep projectile
+                this.addEffect({
+                    id: `hit-${Date.now()}`,
+                    x: hitX,
+                    y: hitY,
+                    type: "explosion",
+                    radius: 15,
+                    lifetime: 0.2,
+                    maxLifetime: 0.2,
+                });
+                return;
+            }
+
+            // More aggressive projectile removal for better visual consistency
+            // Remove ALL projectiles from this shooter within a reasonable radius
+            const projectilesToRemove = [];
+
+            this.projectiles.forEach((p, id) => {
+                if (p.playerId !== shooterId) return;
+                const dx = (p.x || 0) - hitX;
+                const dy = (p.y || 0) - hitY;
+                const distance = dx * dx + dy * dy;
+
+                // Remove projectiles within 100px of hit point (more generous)
+                if (distance <= 100 * 100) {
+                    projectilesToRemove.push(id);
+                }
+            });
+
+            // Remove all matching projectiles
+            projectilesToRemove.forEach(id => {
+                this.projectiles.delete(id);
+                console.log(`Client: Removed projectile ${id} due to server hit confirmation`);
+            });
+
+            // No visual effect for ranger arrows - just clean projectile removal
+        });
+
+        // Handle projectile wall hits (server-authoritative)
+        this.socket.on("projectileWallHit", (data) => {
+            if (!data) return;
+            const { x, y, projectileId, ownerId } = data;
+
+            console.log(
+                `Client: Received projectileWallHit event at (${x.toFixed(
+          1
+        )}, ${y.toFixed(1)}) for projectile ${projectileId}`
+            );
+
+            // Create distinctive wall hit effect
+            this.addEffect({
+                id: `wallHit-${Date.now()}`,
+                x: x,
+                y: y,
+                type: "wallHit", // Special type for wall hits
+                radius: 25,
+                lifetime: 0.4,
+                maxLifetime: 0.4,
+            });
+
+            // Remove the projectile that hit the wall
+            if (projectileId && this.projectiles.has(projectileId)) {
+                this.projectiles.delete(projectileId);
+            } else {
+                // Fallback: remove closest projectile from this owner near the hit point
+                let closestProjectile = null;
+                let closestDistance = Infinity;
+
+                this.projectiles.forEach((p, id) => {
+                    if (p.playerId !== ownerId) return;
+                    const dx = (p.x || 0) - x;
+                    const dy = (p.y || 0) - y;
+                    const distance = dx * dx + dy * dy;
+
+                    if (distance < closestDistance) {
+                        closestDistance = distance;
+                        closestProjectile = id;
+                    }
+                });
+
+                if (closestProjectile && closestDistance <= 100 * 100) {
+                    // Within 100px of hit point
+                    this.projectiles.delete(closestProjectile);
+                }
+            }
+        });
+
+        // Handle server-created projectiles (like penetrating arrows)
+        this.socket.on("projectileCreate", (data) => {
+            if (!data) return;
+            const { id, x, y, vx, vy, size, color, playerId, penetrating } = data;
+
+            this.projectiles.set(id, {
+                id,
+                x,
+                y,
+                vx,
+                vy,
+                size: size || 10,
+                color: color || "#ffffff",
+                playerId,
+                penetrating: penetrating || false,
+                lifetime: 5.0, // Match server TTL
+                maxLifetime: 5.0,
+            });
+        });
+
+        // Zombie waves
+        this.socket.on("waveOver", (data) => {
+            const nextInMs = (data && data.nextInMs) || 3000;
+            const nextWave = (data && data.nextWave) || 1;
+            this.showGameStatusBanner(
+                `Wave cleared! Next wave (${nextWave}) in ${Math.ceil(
+          nextInMs / 1000
+        )}s`
+            );
+            // Update wave counter for next wave
+            this.updateWaveCounter(nextWave);
+        });
+        this.socket.on("waveStarted", (data) => {
+            const wave = (data && data.wave) || 1;
+            this.updateWaveCounter(wave);
+            this.showGameStatusBanner(`Wave ${wave} started!`);
+        });
+
+        // Handle score updates
+        this.socket.on("scoreUpdate", (data) => {
+            const { playerId, newScore } = data;
+            const player = this.players.get(playerId);
+            if (player) {
+                player.score = newScore;
+                this.updateScoreboard();
+            }
+        });
+
+        // Handle player death
+        this.socket.on("playerDeath", (data) => {
+            const { playerId, playerName, livesRemaining, respawnIn, health } = data;
+
+            console.log("Received playerDeath event:", data); // Debug log
+
+            // Update the player's state
+            const player = this.players.get(playerId);
+            if (player) {
+                player.isDead = true;
+                player.lives = livesRemaining;
+                player.health = health || 0; // Use health from server or default to 0
+
+                // Update lives counter if this is the local player
+                if (playerId === this.localPlayerId) {
+                    this.updateLivesCounter();
+                }
+            }
+
+            // Show death message
+            if (playerId === this.localPlayerId) {
+                this.showGameStatusBanner(
+                    `You died! Respawning in ${
+            respawnIn / 1000
+          }s (${livesRemaining} lives left)`,
+                    "warning"
+                );
+            } else {
+                this.showGameStatusBanner(
+                    `${playerName} died! Respawning in ${
+            respawnIn / 1000
+          }s (${livesRemaining} lives left)`
+                );
+            }
+        });
+
+        // Handle player elimination
+        this.socket.on("playerEliminated", (data) => {
+            const { playerId, playerName, health } = data;
+
+            console.log("Received playerEliminated event:", data); // Debug log
+
+            const player = this.players.get(playerId);
+            if (player) {
+                player.isDead = true;
+                player.lives = 0;
+                player.health = health || 0; // Use health from server or default to 0
+
+                // If this is the local player, show game over
+                if (playerId === this.localPlayerId) {
+                    this.showGameStatusBanner(
+                        "GAME OVER! You have been eliminated!",
+                        "error"
+                    );
+                    this.disablePlayerInput();
+                } else {
+                    this.showGameStatusBanner(
+                        `${playerName} was eliminated! (No lives remaining)`
+                    );
+                }
+            }
+        });
+
+        // Handle player respawn
+        this.socket.on("playerRespawn", (data) => {
+            const { playerId, playerName, x, y, livesRemaining } = data;
+
+            console.log("Client: Received playerRespawn event:", data); // Debug log
+
+            this.showGameStatusBanner(
+                `${playerName} respawned! (${livesRemaining} lives remaining)`
+            );
+
+            const player = this.players.get(playerId);
+            if (player) {
+                console.log(`Client: Resetting player ${playerId} state for respawn`); // Debug log
+                player.isDead = false;
+                player.lives = livesRemaining;
+                player.x = x;
+                player.y = y;
+                player.health = 100;
+                player.isInvulnerable = true;
+
+                // Update lives counter if this is the local player
+                if (playerId === this.localPlayerId) {
+                    this.updateLivesCounter();
+                }
+
+                // Remove invulnerability after 3 seconds
+                setTimeout(() => {
+                    if (player) {
+                        player.isInvulnerable = false;
+                    }
+                }, 3000);
+            }
+        });
+        this.socket.on("zombiesState", (data) => {
+            this.zombies = new Map();
+            const list = (data && data.zombies) || [];
+            list.forEach((z) => this.zombies.set(z.id, z));
+        });
+
+        // Handle player state updates from server
+        this.socket.on("playersState", (data) => {
+            if (data && data.players) {
+                console.log(
+                    `Client: Received playersState event with ${data.players.length} players`
+                ); // Debug log
+
+                data.players.forEach((playerData) => {
+                    const existingPlayer = this.players.get(playerData.id);
+                    if (existingPlayer) {
+                        console.log(
+                            `Client: Updating player ${playerData.id} state:`,
+                            playerData
+                        ); // Debug log
+                        // Update existing player with server data
+                        existingPlayer.name = playerData.name || existingPlayer.name;
+                        existingPlayer.score = playerData.score || 0;
+                        existingPlayer.lives = playerData.lives || 3;
+                        existingPlayer.deaths = playerData.deaths || 0;
+                        existingPlayer.kills = playerData.kills || 0;
+                        existingPlayer.isDead = playerData.isDead || false;
+                        existingPlayer.health = playerData.health || 100;
+                    }
+                });
+
+                // Update scoreboard after player state sync
+                this.updateScoreboard();
+            }
+        });
+
+        // Game paused
+        this.socket.on("gamePaused", (data) => {
+            this.pauseGame(data.pausedBy);
+        });
+
+        // Game resumed
+        this.socket.on("gameResumed", (data) => {
+            this.resumeGame(data.resumedBy);
+        });
+
+        // Game quit
+        this.socket.on("gameQuit", (data) => {
+            this.quitGame(data.quitBy);
+        });
+
+        // Game end
+        this.socket.on("gameEnd", (data) => {
+            this.endGame(data.winner);
+        });
+    }
+
+    startGameLoop() {
+        const gameLoop = (currentTime) => {
+            // Always continue the loop
+            requestAnimationFrame(gameLoop);
+
+            // Calculate delta time
+            if (this.lastTime === 0) {
+                this.lastTime = currentTime;
+                return; // Skip first frame to get proper delta time
+            }
+
+            const rawDelta = (currentTime - this.lastTime) / 1000;
+            this.deltaTime = Math.min(rawDelta, 0.033); // Cap at ~30 FPS to prevent large jumps
+            this.lastTime = currentTime;
+
+            // Update FPS counter
+            this.updateFPS(currentTime);
+
+            // Only update and render if game is running
+            if (this.isRunning && !this.isPaused) {
+                // update camera first for correct world/screen mapping
+                this.updateCamera();
+                this.update(this.deltaTime);
+                this.render();
+
+                // Update scoreboard periodically (every 60 frames / ~1 second)
+                if (!this.scoreboardUpdateCounter) this.scoreboardUpdateCounter = 0;
+                this.scoreboardUpdateCounter++;
+                if (this.scoreboardUpdateCounter >= 60) {
+                    this.updateScoreboard();
+                    this.scoreboardUpdateCounter = 0;
+                }
+            }
+        };
+
+        requestAnimationFrame(gameLoop);
+    }
+
+    update(deltaTime) {
+        // Update local player
+        const localPlayer = this.players.get(this.localPlayerId);
+        if (localPlayer) {
+            localPlayer.update(deltaTime, this.walls);
+
+            // Check for local player death (health reached 0)
+            // Only handle locally if server hasn't already sent death event
+            if (localPlayer.health <= 0 && !localPlayer.isDead) {
+                console.log(
+                    "Local death detection: health <= 0, setting isDead = true"
+                ); // Debug log
+                // This is a fallback - the server should handle death authoritatively
+                // But we can provide immediate visual feedback
+                localPlayer.isDead = true;
+                this.updateLivesCounter();
+            }
+
+            // Debug: Log health changes
+            if (localPlayer.health !== localPlayer.lastLoggedHealth) {
+                console.log(
+                    `Client: Local player health changed from ${
+            localPlayer.lastLoggedHealth || "unknown"
+          } to ${localPlayer.health}`
+                );
+                localPlayer.lastLoggedHealth = localPlayer.health;
+            }
+
+            // Send position update to server
+            this.socket.emit("playerMove", {
+                x: localPlayer.x,
+                y: localPlayer.y,
+            });
+        }
+
+        // Update projectiles
+        this.updateProjectiles(deltaTime);
+
+        // Update effects
+        this.updateEffects(deltaTime);
+
+        // Smoothly lerp NPC display position for player-like motion
+        if (this.npc && typeof this.npc.displayX === "number") {
+            const alpha = Math.max(0.0, Math.min(1.0, deltaTime * 12));
+            this.npc.displayX =
+                this.npc.displayX + (this.npc.x - this.npc.displayX) * alpha;
+            this.npc.displayY =
+                this.npc.displayY + (this.npc.y - this.npc.displayY) * alpha;
+        }
+
+        // Update camera
+        this.updateCamera();
+    }
+
+    updateProjectiles(deltaTime) {
+        const expiredProjectiles = [];
+
+        this.projectiles.forEach((projectile, id) => {
+            // Store old position for collision detection
+            const oldX = projectile.x;
+            const oldY = projectile.y;
+
+            // Move projectile
+            projectile.x += projectile.vx * deltaTime;
+            projectile.y += projectile.vy * deltaTime;
+            projectile.lifetime -= deltaTime;
+
+            // Basic trail update
+            if (projectile.trail) {
+                projectile.trailPoints = projectile.trailPoints || [];
+                projectile.trailPoints.push({ x: projectile.x, y: projectile.y });
+                if (projectile.trailPoints.length > (projectile.trailLength || 10)) {
+                    projectile.trailPoints.shift();
+                }
+            }
+
+            // Enhanced wall collision: check line intersection for more accuracy
+            let hitWall = false;
+            for (const wall of this.walls) {
+                if (
+                    this.lineIntersectsRect(oldX, oldY, projectile.x, projectile.y, wall)
+                ) {
+                    hitWall = true;
+                    console.log(
+                        `Client: Local wall collision detected for projectile ${id} at (${oldX.toFixed(
+              1
+            )}, ${oldY.toFixed(1)})`
+                    );
+                    // Create wall hit effect
+                    this.addEffect({
+                        id: `wallHit-${Date.now()}-${id}`,
+                        x: oldX,
+                        y: oldY,
+                        type: "wallHit", // Special type for wall hits
+                        radius: 20,
+                        lifetime: 0.3,
+                        maxLifetime: 0.3,
+                    });
+                    break;
+                }
+            }
+
+            // Client-side zombie collision detection for immediate visual feedback
+            let hitZombie = false;
+            if (this.zombies && this.zombies.size > 0) {
+                for (const [zombieId, zombie] of this.zombies) {
+                    const dx = zombie.x - projectile.x;
+                    const dy = zombie.y - projectile.y;
+                    const hitRadius = (projectile.size || 10) + (zombie.size || 36) * 0.6;
+
+                    if (dx * dx + dy * dy <= hitRadius * hitRadius) {
+                        hitZombie = true;
+                        console.log(
+                            `Client: Local zombie collision detected for projectile ${id} at (${projectile.x.toFixed(1)}, ${projectile.y.toFixed(1)})`
+                        );
+                        // No visual effect - just remove the projectile
+                        break;
+                    }
+                }
+            }
+
+            // Expire projectiles that hit walls, zombies, or expired naturally
+            if (hitWall || hitZombie || projectile.lifetime <= 0) {
+                expiredProjectiles.push(id);
+            }
+        });
+
+        expiredProjectiles.forEach((id) => {
+            this.projectiles.delete(id);
+        });
+    }
+
+    updateEffects(deltaTime) {
+        const expiredEffects = [];
+
+        this.effects.forEach((effect, id) => {
+            effect.lifetime -= deltaTime;
+            if (effect.lifetime <= 0) {
+                expiredEffects.push(id);
+            }
+        });
+
+        expiredEffects.forEach((id) => {
+            this.effects.delete(id);
+        });
+    }
+
+    updateCamera() {
+        // Fixed world size regardless of viewport
+        const worldW = this.worldWidth;
+        const worldH = this.worldHeight;
+        this.camera.x = 0;
+        this.camera.y = 0;
+        // Share world size with Player bounds system
+        if (typeof Player.setWorldSize === "function") {
+            Player.setWorldSize(worldW, worldH);
+        }
+    }
+
+    // Scale the fixed world to fill the browser window while preserving aspect ratio
+    updateScale() {
+        if (!this.gameArea) return;
+        const vw = window.innerWidth || document.documentElement.clientWidth || 1;
+        const vh = window.innerHeight || document.documentElement.clientHeight || 1;
+        const sx = vw / this.worldWidth;
+        const sy = vh / this.worldHeight;
+        const s = Math.min(sx, sy);
+        this.scale = s;
+        this.gameArea.style.transform = `scale(${s})`;
+        const scaledW = this.worldWidth * s;
+        const scaledH = this.worldHeight * s;
+        const left = Math.max(0, (vw - scaledW) / 2);
+        const top = Math.max(0, (vh - scaledH) / 2);
+        this.gameArea.style.left = `${left}px`;
+        this.gameArea.style.top = `${top}px`;
+    }
+
+    // Helper method to check if a line intersects with a rectangle (wall)
+    lineIntersectsRect(x1, y1, x2, y2, rect) {
+        // Check if either endpoint is inside the rectangle
+        if (
+            x1 >= rect.x &&
+            x1 <= rect.x + rect.w &&
+            y1 >= rect.y &&
+            y1 <= rect.y + rect.h
+        )
+            return true;
+        if (
+            x2 >= rect.x &&
+            x2 <= rect.x + rect.w &&
+            y2 >= rect.y &&
+            y2 <= rect.y + rect.h
+        )
+            return true;
+
+        // Check line intersection with each edge of the rectangle
+        const edges = [
+            { x1: rect.x, y1: rect.y, x2: rect.x + rect.w, y2: rect.y }, // top
+            {
+                x1: rect.x + rect.w,
+                y1: rect.y,
+                x2: rect.x + rect.w,
+                y2: rect.y + rect.h,
+            }, // right
+            {
+                x1: rect.x + rect.w,
+                y1: rect.y + rect.h,
+                x2: rect.x,
+                y2: rect.y + rect.h,
+            }, // bottom
+            { x1: rect.x, y1: rect.y + rect.h, x2: rect.x, y2: rect.y }, // left
+        ];
+
+        for (const edge of edges) {
+            if (
+                this.linesIntersect(x1, y1, x2, y2, edge.x1, edge.y1, edge.x2, edge.y2)
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Helper method to check if two line segments intersect
+    linesIntersect(x1, y1, x2, y2, x3, y3, x4, y4) {
+        const denom = (y4 - y3) * (x2 - x1) - (x4 - x3) * (y2 - y1);
+        if (denom === 0) return false; // parallel lines
+
+        const ua = ((x4 - x3) * (y1 - y3) - (y4 - y3) * (x1 - x3)) / denom;
+        const ub = ((x2 - x1) * (y1 - y3) - (y2 - y1) * (x1 - x3)) / denom;
+
+        return ua >= 0 && ua <= 1 && ub >= 0 && ub <= 1;
+    }
+
+    // Helper method to check if a position is inside any wall
+    isPositionInWall(x, y) {
+        for (const wall of this.walls) {
+            if (
+                x >= wall.x &&
+                x <= wall.x + wall.w &&
+                y >= wall.y &&
+                y <= wall.y + wall.h
+            ) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    render() {
+        // Rendering game
+        this.renderer.clear();
+
+        // Debug: Log render call
+        // console debug disabled
+
+        // Debug: Log game area dimensions
+        // console debug disabled
+
+        // Render game objects
+        this.renderer.renderWalls(this.walls, this.camera);
+        // Render zombies
+        if (this.zombies && this.zombies.size) {
+            this.renderer.renderZombies(this.zombies, this.camera);
+        }
+        this.renderer.renderPlayers(this.players, this.localPlayerId, this.camera);
+        this.renderer.renderProjectiles(this.projectiles, this.camera);
+        this.renderer.renderEffects(this.effects, this.camera);
+
+        // Render UI elements
+        this.renderer.renderUI(this);
+    }
+
+    updateFPS(currentTime) {
+        this.frameCount++;
+
+        if (currentTime - this.lastFpsUpdate >= 1000) {
+            this.fps = this.frameCount;
+            this.frameCount = 0;
+            this.lastFpsUpdate = currentTime;
+        }
+    }
+
+    addPlayer(id, name, x, y) {
+        console.log(`Adding player: id=${id}, name="${name}", x=${x}, y=${y}`);
+        const player = new Player(id, name, x, y);
+
+        // Debug: Log player object
+        console.log("Created player object:", {
+            id: player.id,
+            name: player.name,
+            x: player.x,
+            y: player.y,
+        });
+
+        // Add some abilities to players
+        player.addAbility(ABILITIES.speedBoost);
+        player.addAbility(ABILITIES.shield);
+        player.addAbility(ABILITIES.teleport);
+        player.addAbility(ABILITIES.healthRegen);
+        player.addAbility(ABILITIES.weaponSwap);
+
+        // Add some weapons
+        player.addWeapon("rifle");
+        player.addWeapon("shotgun");
+        player.addWeapon("sniper");
+        player.addWeapon("explosive");
+        player.addWeapon("laser");
+        player.addWeapon("plasma");
+        player.addWeapon("minigun");
+        // Class weapons
+        player.addWeapon("healerStaff");
+        player.addWeapon("mageBolt");
+        player.addWeapon("arrow");
+        player.addWeapon("meleeStrike");
+
+        this.players.set(id, player);
+        console.log(
+            `Player added to players Map. Total players: ${this.players.size}`
+        );
+
+        if (id === this.localPlayerId) {
+            // debug disabled
+            // Set up local player controls
+            player.keys = this.keys;
+            console.log(`Local player keys set: ${Array.from(this.keys).join(", ")}`);
+
+            // Update camera to center on local player
+            this.updateCamera();
+            // debug disabled
+        }
+    }
+
+    removePlayer(id) {
+        this.players.delete(id);
+    }
+
+    addProjectile(projectileData) {
+        // Check if projectile starts inside a wall
+        if (this.isPositionInWall(projectileData.x, projectileData.y)) {
+            console.log(
+                `Projectile ${projectileData.id} spawned inside wall at (${projectileData.x}, ${projectileData.y}), skipping`
+            );
+            return; // Don't add projectile if it starts inside a wall
+        }
+
+        this.projectiles.set(projectileData.id, projectileData);
+    }
+
+    addEffect(effectData) {
+        this.effects.set(effectData.id, effectData);
+    }
+
+    startShooting() {
+        if (!this.isRunning || this.isPaused) return;
+
+        const localPlayer = this.players.get(this.localPlayerId);
+        if (!localPlayer) return;
+
+        // Only fire immediately if player can actually shoot
+        if (localPlayer.canShoot()) {
+            this.shoot();
+        }
+
+        // Start continuous shooting timer
+        if (!this.shootingInterval) {
+            this.shootingInterval = setInterval(() => {
+                if (this.isLeftMouseDown && this.isRunning && !this.isPaused) {
+                    const localPlayer = this.players.get(this.localPlayerId);
+                    if (localPlayer && localPlayer.canShoot()) {
+                        this.shoot();
+                    }
+                } else {
+                    // Stop the interval if conditions are no longer met
+                    this.stopShooting();
+                }
+            }, 50); // Check every 50ms for smooth continuous shooting
+        }
+    }
+
+    stopShooting() {
+        if (this.shootingInterval) {
+            clearInterval(this.shootingInterval);
+            this.shootingInterval = null;
+        }
+    }
+
+    shoot() {
+        const localPlayer = this.players.get(this.localPlayerId);
+        if (!localPlayer) return;
+
+        // debug disabled
+
+        if (localPlayer.canShoot()) {
+            // Aim at world coordinates, not screen-space
+            const aimX =
+                typeof this.mouseWorldX === "number" ? this.mouseWorldX : this.mouseX;
+            const aimY =
+                typeof this.mouseWorldY === "number" ? this.mouseWorldY : this.mouseY;
+            const attackResult = localPlayer.shoot(aimX, aimY);
+            if (attackResult) {
+                // Handle melee attacks differently
+                if (attackResult.type === "meleeAttack") {
+                    // Add melee attack as an effect instead of projectile
+                    this.addEffect({
+                        id: attackResult.id,
+                        x: localPlayer.x,
+                        y: localPlayer.y,
+                        type: "meleeAttack",
+                        lifetime: attackResult.lifetime,
+                        maxLifetime: attackResult.maxLifetime,
+                        angle: attackResult.angle,
+                        playerId: localPlayer.id,
+                    });
+                } else if (Array.isArray(attackResult)) {
+                    // Handle mage dual projectiles
+                    attackResult.forEach((projectile) => {
+                        this.addProjectile(projectile);
+                    });
+                } else {
+                    // Regular single projectile
+                    this.addProjectile(attackResult);
+                }
+
+                // Send shot to server
+                this.socket.emit("playerShot", {
+                    targetX: aimX,
+                    targetY: aimY,
+                    // Send minimal weapon data server needs for rate/damage/hit size
+                    weapon: localPlayer.getCurrentWeapon(),
+                    weaponKey: localPlayer.currentWeapon,
+                    damageBoost: localPlayer.className === "melee" && localPlayer.meleeCharge ?
+                        Math.min(40, localPlayer.meleeCharge) : 0,
+                });
+
+                // Play sound
+                this.soundManager.playSound("shoot");
+            }
+        }
+    }
+
+    switchWeapon(weaponName) {
+        const localPlayer = this.players.get(this.localPlayerId);
+        if (localPlayer) {
+            if (localPlayer.changeWeapon(weaponName)) {
+                this.soundManager.playSound("weaponSwitch");
+            }
+        }
+    }
+
+    reloadWeapon() {
+        const localPlayer = this.players.get(this.localPlayerId);
+        if (localPlayer) {
+            if (localPlayer.startReload()) {
+                this.soundManager.playSound("reload");
+            }
+        }
+    }
+
+    useAbility(abilityName) {
+        const localPlayer = this.players.get(this.localPlayerId);
+        if (localPlayer) {
+            if (localPlayer.useAbility(abilityName, this.mouseX, this.mouseY)) {
+                this.soundManager.playSound("ability");
+            }
+        }
+    }
+
+    handlePlayerHit(data) {
+        console.log("Client: Received playerHit event:", data); // Debug log
+
+        const targetPlayer = this.players.get(data.targetId);
+        if (targetPlayer) {
+            console.log(
+                `Client: Updating player ${data.targetId} health from ${targetPlayer.health} to ${data.newHealth}`
+            ); // Debug log
+            targetPlayer.health = data.newHealth;
+        }
+
+        // Update scoreboard
+        this.updateScoreboard();
+
+        // Play hit sound
+        this.soundManager.playSound("hit");
+
+        // Client-side class effects visuals (non-authoritative)
+        const shooter = this.players.get(data.shooterId);
+        if (shooter && shooter.className === "ranged") {
+            // slight recoil effect
+            this.addEffect({
+                id: `ranged-hit-${Date.now()}`,
+                x: targetPlayer ? targetPlayer.x : 0,
+                y: targetPlayer ? targetPlayer.y : 0,
+                type: "speed",
+                lifetime: 0.2,
+                maxLifetime: 0.2,
+            });
+        }
+    }
+
+    pauseGame(pausedBy) {
+        this.isPaused = true;
+        this.updateGameStatus(`Paused by ${pausedBy}`);
+        this.soundManager.playSound("pause");
+    }
+
+    resumeGame(resumedBy) {
+        this.isPaused = false;
+        this.updateGameStatus(`Resumed by ${resumedBy}`);
+        this.soundManager.playSound("resume");
+    }
+
+    quitGame(quitBy) {
+        this.isRunning = false;
+        this.updateGameStatus(`Game quit by ${quitBy}`);
+        this.soundManager.playSound("gameOver");
+
+        // Show game end screen
+        this.showGameEndScreen();
+    }
+
+    endGame(winner) {
+        this.isRunning = false;
+        this.updateGameStatus("Game Over");
+        this.soundManager.playSound("gameOver");
+
+        // Show winner
+        this.showWinnerScreen(winner);
+    }
+
+    updateGameStatus(status) {
+        const gameStatusElement = document.getElementById("gameStatus");
+        if (gameStatusElement) {
+            gameStatusElement.textContent = status;
+        }
+    }
+
+    updateWaveCounter(wave) {
+        const waveCounterElement = document.getElementById("waveCounter");
+        if (waveCounterElement) {
+            waveCounterElement.textContent = `Wave: ${wave}`;
+        }
+    }
+
+    updateLivesCounter() {
+        const livesCounterElement = document.getElementById("livesCounter");
+        const localPlayer = this.players.get(this.localPlayerId);
+        if (livesCounterElement && localPlayer) {
+            const lives = localPlayer.lives || 0;
+            console.log(
+                `Client: Updating lives counter to ${lives} for player ${this.localPlayerId}`
+            ); // Debug log
+            livesCounterElement.textContent = `❤️ ${lives}`;
+
+            // Change color based on lives remaining
+            if (lives <= 1) {
+                livesCounterElement.style.color = "#ff4757"; // Red for critical
+            } else if (lives <= 2) {
+                livesCounterElement.style.color = "#ffa502"; // Orange for warning
+            } else {
+                livesCounterElement.style.color = "#2ed573"; // Green for safe
+            }
+        }
+    }
+
+    handleLocalPlayerDeath() {
+        const localPlayer = this.players.get(this.localPlayerId);
+        if (!localPlayer) return;
+
+        // Mark player as dead locally for immediate visual feedback
+        localPlayer.isDead = true;
+
+        // Update lives counter immediately
+        this.updateLivesCounter();
+
+        // Show immediate death message
+        this.showGameStatusBanner(
+            `You died! Respawning... (${localPlayer.lives} lives remaining)`,
+            "warning"
+        );
+
+        // Show winner screen with current scores when player dies
+        // Create a temporary winner object for display purposes
+        const players = Array.from(this.players.values());
+        const topPlayer = players.reduce((top, player) =>
+            player.score > top.score ? player : top, players[0] || {});
+
+        this.showWinnerScreen(topPlayer);
+
+        // Don't handle respawn locally - let the server handle it
+        // The server will send playerRespawn event with proper coordinates
+    }
+
+    handleLocalPlayerRespawn() {
+        const localPlayer = this.players.get(this.localPlayerId);
+        if (!localPlayer) return;
+
+        // Reset player state
+        localPlayer.isDead = false;
+        localPlayer.health = 100;
+        localPlayer.isInvulnerable = true;
+
+        // Move to random spawn location
+        localPlayer.x = Math.random() * (this.worldWidth - 100) + 50;
+        localPlayer.y = Math.random() * (this.worldHeight - 100) + 50;
+
+        // Reset velocity
+        localPlayer.vx = 0;
+        localPlayer.vy = 0;
+
+        // Show respawn message
+        this.showGameStatusBanner(
+            `Respawned! You are invulnerable for 3 seconds.`,
+            "success"
+        );
+
+        // Remove invulnerability after 3 seconds
+        setTimeout(() => {
+            if (localPlayer) {
+                localPlayer.isInvulnerable = false;
+            }
+        }, 3000);
+    }
+
+    disablePlayerInput() {
+        console.log("disablePlayerInput called"); // Debug log
+
+        // Disable all player input permanently
+        const localPlayer = this.players.get(this.localPlayerId);
+        if (localPlayer) {
+            localPlayer.isDead = true;
+            localPlayer.health = 0;
+        }
+
+        // Show winner screen with current scores when player is permanently disabled
+        const players = Array.from(this.players.values());
+        const topPlayer = players.reduce((top, player) =>
+            player.score > top.score ? player : top, players[0] || {});
+
+        this.showWinnerScreen(topPlayer);
+    }
+
+
+
+
+
+    showGameStatusBanner(message, type = "info") {
+        console.log("showGameStatusBanner called:", message, type); // Debug log
+
+        // Remove existing banner if present
+        let existingBanner = document.getElementById("gameStatusBanner");
+        if (existingBanner) {
+            existingBanner.remove();
+        }
+
+        // Create new banner
+        const banner = document.createElement("div");
+        banner.id = "gameStatusBanner";
+
+        // Set colors based on type
+        let bgColor, textColor, borderColor;
+        switch (type) {
+            case "success":
+                bgColor = "rgba(46, 213, 115, 0.9)";
+                textColor = "#ffffff";
+                borderColor = "#2ed573";
+                break;
+            case "warning":
+                bgColor = "rgba(255, 165, 2, 0.9)";
+                textColor = "#ffffff";
+                borderColor = "#ffa502";
+                break;
+            case "error":
+                bgColor = "rgba(255, 71, 87, 0.9)";
+                textColor = "#ffffff";
+                borderColor = "#ff4757";
+                break;
+            default:
+                bgColor = "rgba(52, 152, 219, 0.9)";
+                textColor = "#ffffff";
+                borderColor = "#3498db";
+        }
+
+        banner.style.cssText = `
+      position: fixed;
+      top: 80px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: ${bgColor};
+      color: ${textColor};
+      padding: 12px 24px;
+      border-radius: 8px;
+      border: 2px solid ${borderColor};
+      font-size: 1.1rem;
+      font-weight: bold;
+      z-index: 1000;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+      text-align: center;
+      max-width: 80%;
+      word-wrap: break-word;
+    `;
+
+        banner.textContent = message;
+        document.body.appendChild(banner);
+
+        // Auto-remove after 5 seconds
+        setTimeout(() => {
+            if (banner && banner.parentNode) {
+                banner.remove();
+            }
+        }, 5000);
+    }
+
+    updateScoreboard() {
+            const scoreboardContent = document.getElementById("scoreboardContent");
+            if (!scoreboardContent) return;
+
+            const players = Array.from(this.players.values());
+            players.sort((a, b) => (b.score || 0) - (a.score || 0));
+
+            // Debug: Log all player data
+            console.log(
+                "Scoreboard update - All players:",
+                players.map((p) => ({
+                    id: p.id,
+                    name: p.name,
+                    score: p.score,
+                    lives: p.lives,
+                    kills: p.kills,
+                    deaths: p.deaths,
+                }))
+            );
+
+            // Ensure all players have proper names
+            players.forEach((player) => {
+                if (!player.name) {
+                    console.warn(`Player ${player.id} missing name, using fallback`);
+                    player.name = `Player ${player.id?.substring(0, 4) || "Unknown"}`;
+                }
+            });
+
+            if (players.length === 0) {
+                scoreboardContent.innerHTML = `<h4>Scoreboard</h4><p>No players found</p>`;
+                return;
+            }
+
+            console.log(`Client: Updating scoreboard with ${players.length} players in ${this.gameMode} mode`); // Debug log
+
+            // Different scoreboard layout for different game modes
+            let scoreboardHTML;
+            if (this.gameMode === "deathmatch") {
+                scoreboardHTML = `
+                <h4>Deathmatch Scoreboard</h4>
+                ${players
+                  .map(
+                    (player) => `
+                        <div class="score-item ${
+                          player.isDead ? "dead-player" : ""
+                        }">
+                            <span class="player-name">${
+                              player.name || "Unknown"
+                            }</span>
+                            <span class="player-kills">💀 ${player.kills || 0}</span>
+                            <span class="player-deaths">💔 ${player.deaths || 0}</span>
+                            <span class="player-score">${player.score || 0}</span>
+                        </div>
+                    `
+                  )
+                  .join("")}
+            `;
+            } else {
+                // Survival mode - show lives
+                scoreboardHTML = `
+                <h4>Survival Scoreboard</h4>
+                ${players
+                  .map(
+                    (player) => `
+                        <div class="score-item ${
+                          player.isDead ? "dead-player" : ""
+                        }">
+                            <span class="player-name">${
+                              player.name || "Unknown"
+                            }</span>
+                            <span class="player-lives">❤️ ${
+                              player.lives || 0
+                            }</span>
+                            <span class="player-score">${player.score || 0}</span>
+                        </div>
+                    `
+                  )
+                  .join("")}
+            `;
+            }
+
+    console.log("Generated scoreboard HTML:", scoreboardHTML);
+    scoreboardContent.innerHTML = scoreboardHTML;
+
+    // Debug: Log one player's data if available
+    if (players.length > 0) {
+      console.log("Sample player data:", {
+        name: players[0].name,
+        score: players[0].score,
+        lives: players[0].lives,
+        id: players[0].id,
+      });
+    }
+  }
+
+  updateLobbyInfo(data) {
+    // Update player count
+    const playerCountElement = document.getElementById("playerCount");
+    if (playerCountElement) {
+      playerCountElement.textContent = `${data.players.length}/4`;
+    }
+
+    // Update players list
+    const playersListElement = document.getElementById("playersList");
+    if (playersListElement) {
+      playersListElement.innerHTML = data.players
+        .map(
+          (player) => `
+                <div class="player-item">
+                    <span class="player-name">${player.name}</span>
+                    <span class="player-host">${
+                      player.id === this.localPlayerId ? "You" : "Player"
+                    }</span>
+                </div>
+            `
+        )
+        .join("");
+    }
+
+    // Update start button
+    const startGameBtn = document.getElementById("startGameBtn");
+    if (startGameBtn) {
+      startGameBtn.disabled = data.players.length < 2;
+    }
+  }
+
+  showGameEndScreen() {
+    const gameEndOverlay = document.getElementById("gameEndOverlay");
+    if (gameEndOverlay) {
+      gameEndOverlay.classList.remove("hidden");
+    }
+  }
+
+  showWinnerScreen(winner) {
+    const gameEndOverlay = document.getElementById("gameEndOverlay");
+    const winnerInfo = document.getElementById("winnerInfo");
+    const finalScoresList = document.getElementById("finalScoresList");
+
+    if (gameEndOverlay && winnerInfo && finalScoresList) {
+      winnerInfo.innerHTML = `
+                <h4>🏆 MVP!</h4>
+                <p>${winner.name} is the MVP with ${winner.score} points!</p>
+            `;
+
+      const players = Array.from(this.players.values());
+      players.sort((a, b) => b.score - a.score);
+
+      finalScoresList.innerHTML = players
+        .map(
+          (player) => `
+                <div class="final-score-item">
+                    <span>${player.name}</span>
+                    <span>${player.score} pts (${player.kills} kills, ${player.deaths} deaths)</span>
+                </div>
+            `
+        )
+        .join("");
+
+      gameEndOverlay.classList.remove("hidden");
+    }
+  }
+
+  setLocalPlayerId(id) {
+    console.log(`Setting local player ID to: ${id}`);
+    this.localPlayerId = id;
+
+    // For testing: Set game as running so we can see players immediately
+    // In production, this should only happen when the server sends gameStarted
+    this.isRunning = true;
+    console.log(
+      `Game set as running for testing. isRunning: ${this.isRunning}`
+    );
+  }
+
+  getGameTime() {
+    if (!this.gameStartTime) {
+      return 0;
+    }
+    const elapsed = Date.now() - this.gameStartTime;
+    return elapsed;
+  }
+
+  getGameTimeRemaining() {
+    const remaining = Math.max(0, this.gameDuration - this.getGameTime());
+    return remaining;
+  }
+
+  formatTime(milliseconds) {
+    const seconds = Math.floor(milliseconds / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return `${minutes}:${remainingSeconds.toString().padStart(2, "0")}`;
+  }
+
+  restartGame() {
+    console.log("Restarting game...");
+    
+    // Clear all game state
+    this.players.clear();
+    this.projectiles.clear();
+    this.effects.clear();
+    this.zombies.clear();
+    
+    // Reset game state
+    this.isRunning = false;
+    this.isPaused = false;
+    this.gameStartTime = null;
+    this.lastTime = 0;
+    this.deltaTime = 0;
+    
+    // Clear UI elements
+    // Hide game end overlay if present
+    const gameEndOverlay = document.getElementById("gameEndOverlay");
+    if (gameEndOverlay) {
+        gameEndOverlay.classList.add("hidden");
+    }
+    
+    // Reset camera
+    this.camera = { x: 0, y: 0 };
+    
+    // Reinitialize the game
+    this.init();
+    
+    // Emit restart event to server if connected
+    if (this.socket && this.socket.connected) {
+      this.socket.emit("restartGame");
+    }
+    
+    console.log("Game restarted successfully");
+  }
+}
+
+// Game Renderer
+class GameRenderer {
+  constructor(gameArea) {
+    this.gameArea = gameArea;
+    this.gameObjects = new Map(); // Track DOM elements for game objects
+    this.cleanupInterval = null;
+    this.gameEngine = null; // Will be set by GameEngine
+    this.init();
+  }
+
+  init() {
+    // Set up cleanup interval to remove unused DOM elements
+    this.cleanupInterval = setInterval(() => {
+      this.cleanupUnusedElements();
+    }, 5000); // Clean up every 5 seconds
+  }
+
+  clear() {
+    // Remove all game object DOM elements
+    this.gameObjects.forEach((element) => {
+      if (element && element.parentNode) {
+        element.parentNode.removeChild(element);
+      }
+    });
+    this.gameObjects.clear();
+  }
+
+  renderWalls(walls, camera) {
+    walls.forEach((wall, idx) => {
+      let el = this.gameObjects.get(`wall-${idx}`);
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "game-wall";
+        el.id = `wall-${idx}`;
+        this.gameArea.appendChild(el);
+        this.gameObjects.set(`wall-${idx}`, el);
+      }
+      const sx = wall.x - camera.x;
+      const sy = wall.y - camera.y;
+      el.style.left = `${sx}px`;
+      el.style.top = `${sy}px`;
+      el.style.width = `${wall.w}px`;
+      el.style.height = `${wall.h}px`;
+      el.style.transform = `translate(0, 0)`;
+    });
+  }
+
+  renderNPC(npc, camera) {
+    let el = this.gameObjects.get("npc");
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "game-npc";
+      el.id = "npc";
+      // simple visual
+      el.style.width = "40px";
+      el.style.height = "40px";
+      el.style.borderRadius = "50%";
+      el.style.backgroundColor = "#ff9933";
+      el.style.border = "2px solid #ffffff";
+      el.style.position = "absolute";
+      el.style.pointerEvents = "none";
+      el.style.zIndex = "5";
+      // Health bar container
+      const hp = document.createElement("div");
+      hp.className = "npc-health";
+      hp.style.position = "absolute";
+      hp.style.bottom = "48px";
+      hp.style.left = "50%";
+      hp.style.transform = "translateX(-50%)";
+      hp.style.width = "50px";
+      hp.style.height = "6px";
+      hp.style.background = "rgba(0,0,0,0.4)";
+      hp.style.border = "1px solid #222";
+      hp.style.borderRadius = "3px";
+      const fill = document.createElement("div");
+      fill.className = "npc-health-fill";
+      fill.style.height = "100%";
+      fill.style.width = "100%";
+      fill.style.background = "#2ed573";
+      fill.style.borderRadius = "2px";
+      hp.appendChild(fill);
+      el.appendChild(hp);
+      this.gameArea.appendChild(el);
+      this.gameObjects.set("npc", el);
+    }
+    const sx =
+      (typeof npc.displayX === "number" ? npc.displayX : npc.x) - camera.x;
+    const sy =
+      (typeof npc.displayY === "number" ? npc.displayY : npc.y) - camera.y;
+    el.style.left = `${sx}px`;
+    el.style.top = `${sy}px`;
+    el.style.transform = `translate(-50%, -50%)`;
+    // Update HP bar
+    const fill = el.querySelector(".npc-health-fill");
+    if (fill) {
+      const maxHp = npc.maxHealth || 200;
+      const pct = Math.max(0, Math.min(1, (npc.health || maxHp) / maxHp));
+      fill.style.width = `${pct * 100}%`;
+      fill.style.background =
+        pct > 0.5 ? "#2ed573" : pct > 0.25 ? "#ffa502" : "#ff4757";
+    }
+  }
+
+  renderZombies(zombies, camera) {
+    // Mark all existing zombie nodes for reuse
+    const activeKeys = new Set();
+    zombies.forEach((z, id) => {
+      activeKeys.add(`z-${id}`);
+      let el = this.gameObjects.get(`z-${id}`);
+      if (!el) {
+        el = document.createElement("div");
+        el.className = "game-player";
+        el.id = `z-${id}`;
+        el.style.pointerEvents = "none";
+        // Visuals similar to player
+        const circle = document.createElement("div");
+        circle.className = "player-circle";
+        el.appendChild(circle);
+        // No name tag for zombies
+        const bar = document.createElement("div");
+        bar.className = "player-health-bar";
+        const fill = document.createElement("div");
+        fill.className = "player-health-fill";
+        bar.appendChild(fill);
+        el.appendChild(bar);
+        this.gameArea.appendChild(el);
+        this.gameObjects.set(`z-${id}`, el);
+      }
+
+      // Smooth interpolation for zombie movement
+      if (!el._targetPos) {
+        el._targetPos = { x: z.x, y: z.y };
+        el._currentPos = { x: z.x, y: z.y };
+      }
+
+      // Update target position
+      el._targetPos.x = z.x;
+      el._targetPos.y = z.y;
+
+      // Interpolate to target position for smooth movement
+      const lerpFactor = 0.75; // Increased from 0.6 for even smoother movement and less teleporting
+      el._currentPos.x += (el._targetPos.x - el._currentPos.x) * lerpFactor;
+      el._currentPos.y += (el._targetPos.y - el._currentPos.y) * lerpFactor;
+
+      const sx = el._currentPos.x - camera.x;
+      const sy = el._currentPos.y - camera.y;
+
+      el.style.left = `${sx}px`;
+      el.style.top = `${sy}px`;
+      el.style.transform = `translate(-50%, -50%)`;
+
+      const circle = el.querySelector(".player-circle");
+      if (circle && !circle._initialized) {
+        const size = z.size || 36;
+        circle.style.width = `${size}px`;
+        circle.style.height = `${size}px`;
+        
+        // Different colors and styles for different NPC types
+        if (z.type === "fastMob") {
+          circle.style.backgroundColor = "#ff6b35"; // Orange for fast mobs
+          circle.style.borderColor = "#ffd700";
+          circle.style.borderWidth = "3px";
+          circle.style.boxShadow = "0 0 15px rgba(255, 107, 53, 0.6)";
+          
+          // Add enhanced visual effects for fast mob weaving
+          const weaveTime = Date.now() * 0.008; // Slowed down from 0.01 for more visible weaving
+          const weaveIntensity = Math.sin(weaveTime) * 0.5 + 0.7; // Increased from 0.3 to 0.5 for more dramatic effect
+          
+          // Dynamic color based on movement pattern and speed
+          const speed = Math.sqrt(z.vx * z.vx + z.vy * z.vy);
+          const speedFactor = Math.min(1, speed / 200); // Normalize speed factor
+          
+          // Color shifts based on movement intensity - more dramatic for bigger weave
+          const baseHue = 30; // Orange base
+          const hueShift = Math.sin(weaveTime * 2) * 25; // Increased from 15 to 25 for more color variation
+          const saturation = 75 + speedFactor * 25; // Higher saturation when moving fast
+          const lightness = 45 + weaveIntensity * 25 + speedFactor * 15; // More dramatic lightness changes
+          
+          const weaveColor = `hsl(${baseHue + hueShift}, ${saturation}%, ${lightness}%)`;
+          circle.style.backgroundColor = weaveColor;
+          
+          // Enhanced motion blur effect for fast movement (reduced intensity)
+          if (speed > 100) {
+            const blurAmount = Math.min(2, speed / 120); // Reduced from 4px max and 80 divisor
+            circle.style.filter = `blur(${blurAmount}px)`;
+          } else {
+            circle.style.filter = "blur(0px)";
+          }
+          
+          // Enhanced trail effect for weaving movement - increased opacity for bigger weave visibility
+          if (!el.querySelector(".fast-mob-trail")) {
+            const trail = document.createElement("div");
+            trail.className = "fast-mob-trail";
+            trail.style.position = "absolute";
+            trail.style.width = "120%"; // Increased from 100% to make trail bigger
+            trail.style.height = "120%"; // Increased from 100% to make trail bigger
+            trail.style.borderRadius = "50%";
+            trail.style.background = "radial-gradient(circle, rgba(255, 107, 53, 0.25) 0%, rgba(255, 215, 0, 0.15) 30%, transparent 70%)"; // Increased opacity and added golden trail
+            trail.style.animation = "fastMobTrail 0.8s ease-out forwards"; // Slowed down from 0.5s for longer trail visibility
+            trail.style.transform = "translate(-10%, -10%)"; // Center the larger trail
+            el.appendChild(trail);
+          }
+          
+          // Add weaving pattern indicator
+          const patternTime = (Date.now() / 3000) % 4;
+          let patternName = "";
+          if (patternTime < 1) patternName = "Sine";
+          else if (patternTime < 2) patternName = "Figure-8";
+          else if (patternTime < 3) patternName = "Spiral";
+          else patternName = "Zigzag";
+          
+          // Update trail color based on current pattern (reduced opacity)
+          const trail = el.querySelector(".fast-mob-trail");
+          if (trail) {
+            const patternColors = {
+              "Sine": "rgba(255, 107, 53, 0.2)", // Reduced from 0.4
+              "Figure-8": "rgba(255, 215, 0, 0.2)", // Reduced from 0.4
+              "Spiral": "rgba(255, 69, 0, 0.2)", // Reduced from 0.4
+              "Zigzag": "rgba(255, 140, 0, 0.2)" // Reduced from 0.4
+            };
+            trail.style.background = `radial-gradient(circle, ${patternColors[patternName]} 0%, transparent 70%)`;
+          }
+        } else if (z.type === "bossMob") {
+          circle.style.backgroundColor = "#8b0000"; // Dark red for boss mobs
+          circle.style.borderColor = "#ff4500";
+          circle.style.borderWidth = "4px";
+          circle.style.boxShadow = "0 0 25px rgba(139, 0, 0, 0.8)";
+        } else {
+          // Regular zombie
+          circle.style.backgroundColor = "#3cb371";
+          circle.style.borderColor = "#ffffff";
+          circle.style.borderWidth = "2px";
+        }
+        
+        circle._initialized = true;
+      }
+
+      // Visual indication for slowed zombies and special effects
+      if (circle) {
+        const isSlowed = z.slowUntil && Date.now() < z.slowUntil;
+        if (isSlowed) {
+          // Apply slow effect with different colors for different NPC types
+          if (z.type === "fastMob") {
+            circle.style.backgroundColor = "#4169e1"; // Blue when slowed
+            circle.style.border = "3px solid #00bfff";
+          } else if (z.type === "bossMob") {
+            circle.style.backgroundColor = "#4b0082"; // Dark purple when slowed
+            circle.style.border = "4px solid #9370db";
+          } else {
+            circle.style.backgroundColor = "#4169e1"; // Blue when slowed
+            circle.style.border = "2px solid #00bfff";
+          }
+        } else if (circle._wasSlowed) {
+          // Reset color when no longer slowed
+          if (z.type === "fastMob") {
+            circle.style.backgroundColor = "#ff6b35";
+            circle.style.border = "3px solid #ffd700";
+          } else if (z.type === "bossMob") {
+            circle.style.backgroundColor = "#8b0000";
+            circle.style.border = "4px solid #ff4500";
+          } else {
+            circle.style.backgroundColor = "#3cb371";
+            circle.style.border = "2px solid #ffffff";
+          }
+        }
+        circle._wasSlowed = isSlowed;
+        
+        // Add pulsing effect for boss mobs to show they're special
+        if (z.type === "bossMob") {
+          const pulseIntensity = 0.1 + 0.05 * Math.sin(Date.now() * 0.005);
+          circle.style.boxShadow = `0 0 ${25 + pulseIntensity * 20}px rgba(139, 0, 0, ${0.8 + pulseIntensity})`;
+        }
+      }
+
+      const fill = el.querySelector(".player-health-fill");
+      if (fill) {
+        const maxHp = z.maxHealth || 120;
+        const pct = Math.max(0, Math.min(1, (z.health || maxHp) / maxHp));
+        const widthPct = `${pct * 100}%`;
+
+        // Only update if health percentage changed significantly
+        if (fill._lastWidth !== widthPct) {
+          fill.style.width = widthPct;
+          fill.style.backgroundColor =
+            pct > 0.5 ? "#2ed573" : pct > 0.25 ? "#ffa502" : "#ff4757";
+          fill._lastWidth = widthPct;
+        }
+      }
+    });
+
+    // Cleanup zombie nodes not present
+    const toRemove = [];
+    this.gameObjects.forEach((el, key) => {
+      if (key.startsWith("z-") && !activeKeys.has(key)) {
+        toRemove.push(key);
+      }
+    });
+    toRemove.forEach((k) => {
+      const el = this.gameObjects.get(k);
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+      this.gameObjects.delete(k);
+    });
+  }
+
+  renderPlayers(players, localPlayerId, camera) {
+    // console.debug(`Rendering ${players.size} players. Camera: (${camera.x}, ${camera.y})`);
+    players.forEach((player, id) => {
+      const isLocalPlayer = id === localPlayerId;
+      const screenX = player.x - camera.x;
+      const screenY = player.y - camera.y;
+
+      // debug disabled
+
+      let playerElement = this.gameObjects.get(`player-${id}`);
+
+      if (!playerElement) {
+        // console.debug(`Creating new DOM element for player: ${player.name}`);
+        // Create new player element
+        playerElement = document.createElement("div");
+        playerElement.className = "game-player";
+        playerElement.id = `player-${id}`;
+
+        // Create player visual elements
+        const playerCircle = document.createElement("div");
+        playerCircle.className = "player-circle";
+        playerElement.appendChild(playerCircle);
+
+        const playerName = document.createElement("div");
+        playerName.className = "player-name";
+        playerElement.appendChild(playerName);
+
+        const healthBar = document.createElement("div");
+        healthBar.className = "player-health-bar";
+        const healthFill = document.createElement("div");
+        healthFill.className = "player-health-fill";
+        healthBar.appendChild(healthFill);
+        playerElement.appendChild(healthBar);
+
+        const weaponIndicator = document.createElement("div");
+        weaponIndicator.className = "player-weapon";
+        playerElement.appendChild(weaponIndicator);
+
+        this.gameArea.appendChild(playerElement);
+        this.gameObjects.set(`player-${id}`, playerElement);
+      }
+
+      // Update position
+      playerElement.style.left = `${screenX}px`;
+      playerElement.style.top = `${screenY}px`;
+      playerElement.style.transform = `translate(-50%, -50%)`;
+
+      // Remove debug visuals
+      playerElement.style.border = "";
+      playerElement.style.backgroundColor = "";
+
+      // Update visual properties
+      const playerCircle = playerElement.querySelector(".player-circle");
+      if (playerCircle) {
+        playerCircle.style.width = `${player.size}px`;
+        playerCircle.style.height = `${player.size}px`;
+
+        // Handle dead players
+        if (player.isDead) {
+          playerCircle.style.backgroundColor = "#666666"; // Gray for dead
+          playerCircle.style.opacity = "0.3";
+          playerElement.style.display = "none"; // Hide dead players
+        } else {
+          playerElement.style.display = "block";
+          playerCircle.style.opacity = "1";
+
+          // Handle invulnerability
+          if (player.isInvulnerable) {
+            // Flashing effect for invulnerable players
+            const flashTime = Date.now() % 500;
+            playerCircle.style.opacity = flashTime < 250 ? "0.5" : "1";
+            playerCircle.style.backgroundColor = "#00ffff"; // Cyan for invulnerable
+            playerCircle.style.borderColor = "#ffffff";
+          } else {
+            playerCircle.style.backgroundColor = player.color;
+            playerCircle.style.borderColor = isLocalPlayer
+              ? "#28a745"
+              : "#dc3545";
+          }
+        }
+      }
+
+      // Update name
+      const playerName = playerElement.querySelector(".player-name");
+      if (playerName) {
+        if (player.isDead) {
+          playerName.style.display = "none"; // Hide nametag for dead players
+        } else {
+          playerName.style.display = "block";
+          playerName.textContent = player.name;
+          playerName.style.color = "white";
+        }
+      }
+
+      // Update health bar
+      const healthFill = playerElement.querySelector(".player-health-fill");
+      if (healthFill) {
+        const healthPercent = (player.health / player.maxHealth) * 100;
+        healthFill.style.width = `${healthPercent}%`;
+        healthFill.style.backgroundColor =
+          healthPercent > 50
+            ? "#2ed573"
+            : healthPercent > 25
+            ? "#ffa502"
+            : "#ff4757";
+      }
+
+      // Update weapon indicator
+      const weaponIndicator = playerElement.querySelector(".player-weapon");
+      if (weaponIndicator && isLocalPlayer) {
+        weaponIndicator.textContent = player.currentWeapon;
+        weaponIndicator.style.color = "yellow";
+      }
+    });
+  }
+
+  renderProjectiles(projectiles, camera) {
+    projectiles.forEach((projectile, id) => {
+      const screenX = projectile.x - camera.x;
+      const screenY = projectile.y - camera.y;
+
+      let projectileElement = this.gameObjects.get(`projectile-${id}`);
+
+      if (!projectileElement) {
+        // Create new projectile element
+        projectileElement = document.createElement("div");
+        projectileElement.className = "game-projectile";
+        projectileElement.id = `projectile-${id}`;
+        projectileElement.style.width = `${projectile.size}px`;
+        projectileElement.style.height = `${projectile.size}px`;
+        projectileElement.style.backgroundColor = projectile.color;
+        projectileElement.style.position = "absolute";
+        projectileElement.style.pointerEvents = "none";
+
+        // Special styling for different projectile types
+        if (projectile.ownerType === "bossMob") {
+          // Boss mob projectiles - dark red with evil glow
+          if (projectile.penetrating) {
+            // Boss ranged ability (penetrating)
+            projectileElement.style.width = `${projectile.size * 4}px`;
+            projectileElement.style.height = `${projectile.size * 0.8}px`;
+            projectileElement.style.borderRadius = `${projectile.size * 0.4}px`;
+            projectileElement.style.background = `linear-gradient(90deg, #8b0000 0%, #dc143c 50%, #b22222 100%)`;
+            projectileElement.style.boxShadow =
+              "0 0 25px rgba(139,0,0,1), 0 0 50px rgba(139,0,0,0.8), 0 0 75px rgba(139,0,0,0.6)";
+            projectileElement.style.border = "2px solid #ff4500";
+          } else {
+            // Boss regular projectile
+            projectileElement.style.width = `${projectile.size}px`;
+            projectileElement.style.height = `${projectile.size}px`;
+            projectileElement.style.borderRadius = "50%";
+            projectileElement.style.background = `linear-gradient(45deg, #8b0000 0%, #dc143c 100%)`;
+            projectileElement.style.boxShadow =
+              "0 0 20px rgba(139,0,0,1), 0 0 40px rgba(139,0,0,0.8)";
+            projectileElement.style.border = "2px solid #ff4500";
+          }
+        } else if (projectile.penetrating) {
+          // Make it more like basic arrow but bigger with glow - similar proportions to basic arrow
+          projectileElement.style.width = `${projectile.size * 4}px`; // Keep same length
+          projectileElement.style.height = `${projectile.size * 0.8}px`; // Same proportions as basic arrow
+          projectileElement.style.borderRadius = `${projectile.size * 0.4}px`; // Same rounded style as basic arrow
+          projectileElement.style.background = `linear-gradient(90deg, #f1fa8c 0%, #e6d700 50%, #d4c400 100%)`; // Same gradient as basic arrow
+          projectileElement.style.boxShadow =
+            "0 0 20px rgba(241,250,140,1), 0 0 40px rgba(241,250,140,0.6), 0 0 60px rgba(241,250,140,0.3)"; // Strong glow matching arrow color
+          projectileElement.style.border = "1px solid #b8a800"; // Same border as basic arrow
+        } else if (projectile.color === "#f1fa8c") {
+          // Special styling for ranger's basic arrow - make it longer like an arrow
+          projectileElement.style.width = `${projectile.size * 3}px`; // Make it 3x longer
+          projectileElement.style.height = `${projectile.size * 0.8}px`; // Make it thinner
+          projectileElement.style.borderRadius = `${projectile.size * 0.4}px`; // Rounded but not circular
+          projectileElement.style.background = `linear-gradient(90deg, #f1fa8c 0%, #e6d700 50%, #d4c400 100%)`; // Arrow gradient
+          projectileElement.style.border = "1px solid #b8a800";
+        } else {
+          projectileElement.style.borderRadius = "50%";
+        }
+
+        this.gameArea.appendChild(projectileElement);
+        this.gameObjects.set(`projectile-${id}`, projectileElement);
+      }
+
+      // Use transform for better performance than left/top
+      if (projectile.ownerType === "bossMob") {
+        // Boss mob projectile positioning
+        if (projectile.penetrating) {
+          // Boss ranged ability (penetrating)
+          const angle = Math.atan2(projectile.vy, projectile.vx) * (180 / Math.PI);
+          projectileElement.style.transform = `translate(${
+            screenX - projectile.size * 2
+          }px, ${screenY - projectile.size * 0.4}px) rotate(${angle}deg)`;
+        } else {
+          // Boss regular projectile
+          projectileElement.style.transform = `translate(${
+            screenX - projectile.size / 2
+          }px, ${screenY - projectile.size / 2}px)`;
+        }
+      } else if (projectile.penetrating) {
+        // Calculate rotation for penetrating arrows based on velocity
+        const angle =
+          Math.atan2(projectile.vy, projectile.vx) * (180 / Math.PI);
+        projectileElement.style.transform = `translate(${
+          screenX - projectile.size * 2
+        }px, ${screenY - projectile.size * 0.4}px) rotate(${angle}deg)`; // Updated to match basic arrow positioning
+      } else if (projectile.color === "#f1fa8c") {
+        // Calculate rotation for ranger's basic arrow based on velocity
+        const angle =
+          Math.atan2(projectile.vy, projectile.vx) * (180 / Math.PI);
+        projectileElement.style.transform = `translate(${
+          screenX - projectile.size * 1.5
+        }px, ${screenY - projectile.size * 0.4}px) rotate(${angle}deg)`;
+      } else {
+        projectileElement.style.transform = `translate(${
+          screenX - projectile.size / 2
+        }px, ${screenY - projectile.size / 2}px)`;
+      }
+
+      // Add trail effect if enabled
+      if (projectile.trail && projectile.trailPoints.length > 0) {
+        this.renderProjectileTrail(projectile, camera, id);
+      }
+    });
+  }
+
+  renderProjectileTrail(projectile, camera, projectileId) {
+    // Remove old trail
+    const oldTrail = this.gameObjects.get(`trail-${projectileId}`);
+    if (oldTrail) {
+      oldTrail.remove();
+      this.gameObjects.delete(`trail-${projectileId}`);
+    }
+
+    if (projectile.trailPoints.length > 1) {
+      const trailElement = document.createElement("div");
+      trailElement.className = "projectile-trail";
+      trailElement.id = `trail-${projectileId}`;
+
+      // Create SVG path for trail
+      const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      const path = document.createElementNS(
+        "http://www.w3.org/2000/svg",
+        "path"
+      );
+
+      let pathData = "";
+      projectile.trailPoints.forEach((point, index) => {
+        const x = point.x - camera.x;
+        const y = point.y - camera.y;
+        if (index === 0) {
+          pathData += `M ${x} ${y}`;
+        } else {
+          pathData += ` L ${x} ${y}`;
+        }
+      });
+
+      path.setAttribute("d", pathData);
+      path.setAttribute("stroke", projectile.color);
+      path.setAttribute("stroke-width", "2");
+      path.setAttribute("fill", "none");
+      path.setAttribute("opacity", "0.6");
+
+      svg.appendChild(path);
+      trailElement.appendChild(svg);
+
+      this.gameArea.appendChild(trailElement);
+      this.gameObjects.set(`trail-${projectileId}`, trailElement);
+    }
+  }
+
+  renderEffects(effects, camera) {
+    effects.forEach((effect, id) => {
+      // Handle special effects that follow players
+      if (effect.followPlayerId) {
+        const player = this.gameEngine?.players.get(effect.followPlayerId);
+        if (player) {
+          effect.x = player.x;
+          effect.y = player.y;
+        }
+      }
+
+      const screenX = effect.x - camera.x;
+      const screenY = effect.y - camera.y;
+
+      let effectElement = this.gameObjects.get(`effect-${id}`);
+
+      if (!effectElement) {
+        // Create new effect element
+        effectElement = document.createElement("div");
+        effectElement.className = "game-effect";
+        effectElement.id = `effect-${id}`;
+
+        this.gameArea.appendChild(effectElement);
+        this.gameObjects.set(`effect-${id}`, effectElement);
+      }
+
+      // Update position
+      effectElement.style.left = `${screenX}px`;
+      effectElement.style.top = `${screenY}px`;
+      effectElement.style.transform = `translate(-50%, -50%)`;
+
+      // Render different effect types
+      switch (effect.type) {
+        case "explosion":
+          this.renderExplosion(effectElement, effect);
+          break;
+        case "heal":
+          this.renderHealEffect(effectElement, effect);
+          break;
+        case "speed":
+          this.renderSpeedEffect(effectElement, effect);
+          break;
+        case "block":
+          this.renderBlockEffect(effectElement, effect);
+          break;
+        case "meleeAttack":
+          this.renderMeleeAttackEffect(effectElement, effect);
+          break;
+        case "slam":
+          this.renderSlamEffect(effectElement, effect);
+          break;
+        case "wallHit":
+          this.renderWallHitEffect(effectElement, effect);
+          break;
+      }
+    });
+  }
+
+  renderExplosion(effectElement, effect) {
+    const radius = effect.radius;
+    const alpha = effect.lifetime / effect.maxLifetime;
+
+    effectElement.style.width = `${radius * 2}px`;
+    effectElement.style.height = `${radius * 2}px`;
+    effectElement.style.backgroundColor = "#ff4757";
+    effectElement.style.borderRadius = "50%";
+    effectElement.style.opacity = alpha;
+  }
+
+  renderHealEffect(effectElement, effect) {
+    const size = 36;
+    const alpha = effect.lifetime / effect.maxLifetime;
+
+    // Draw a plus-like shape using CSS: two rectangles overlapped
+    effectElement.style.width = `${size}px`;
+    effectElement.style.height = `${size}px`;
+    effectElement.style.background = "none";
+    effectElement.innerHTML = "";
+
+    const vert = document.createElement("div");
+    const horiz = document.createElement("div");
+
+    [vert, horiz].forEach((el) => {
+      el.style.position = "absolute";
+      el.style.backgroundColor = "#2ed573";
+      el.style.borderRadius = "3px";
+      el.style.opacity = alpha;
+    });
+
+    vert.style.width = `${Math.max(6, size * 0.2)}px`;
+    vert.style.height = `${size}px`;
+    vert.style.left = `${(size - parseFloat(vert.style.width)) / 2}px`;
+    vert.style.top = `0px`;
+
+    horiz.style.height = `${Math.max(6, size * 0.2)}px`;
+    horiz.style.width = `${size}px`;
+    horiz.style.top = `${(size - parseFloat(horiz.style.height)) / 2}px`;
+    horiz.style.left = `0px`;
+
+    effectElement.appendChild(vert);
+    effectElement.appendChild(horiz);
+    effectElement.style.opacity = alpha;
+  }
+
+  renderSpeedEffect(effectElement, effect) {
+    const size = effect.radius ? effect.radius * 2 : 40;
+    const alpha = effect.lifetime / effect.maxLifetime;
+
+    // Full-size disk (no growth), fading out
+    effectElement.style.width = `${size}px`;
+    effectElement.style.height = `${size}px`;
+    effectElement.style.backgroundColor = "rgba(255,165,2,0.5)";
+    effectElement.style.border = "2px solid #ffa502";
+    effectElement.style.borderRadius = "50%";
+    effectElement.style.opacity = alpha;
+  }
+
+  renderBlockEffect(effectElement, effect) {
+    // Create a C-shaped shield around the melee character
+    const shieldSize = 80;
+    const angle = effect.angle || 0;
+
+    effectElement.style.width = `${shieldSize}px`;
+    effectElement.style.height = `${shieldSize}px`;
+    effectElement.style.background = "none";
+    effectElement.style.border = "none";
+    effectElement.style.borderRadius = "50%";
+    effectElement.style.transform = `translate(-50%, -50%) rotate(${angle}deg)`;
+    effectElement.style.opacity = "0.9";
+    effectElement.style.boxShadow = "0 0 20px rgba(0,123,255,0.6)";
+
+    // Clear any existing content
+    effectElement.innerHTML = "";
+
+    // Create C-shaped shield using CSS clip-path
+    effectElement.style.background = "rgba(0,123,255,0.8)";
+    effectElement.style.clipPath =
+      "polygon(50% 0%, 100% 0%, 100% 100%, 50% 100%, 50% 80%, 80% 80%, 80% 20%, 50% 20%)";
+  }
+
+  renderMeleeAttackEffect(effectElement, effect) {
+    // Create a more realistic sword slash visual
+    const swordLength = 120; // Match actual melee hitbox range
+    const swordWidth = 4; // 2x narrower, more sword-like
+    const alpha = effect.lifetime / effect.maxLifetime;
+    const angle = effect.angle || 0;
+    
+    // Calculate animation progress for dynamic effects
+    const progress = 1 - alpha; // 0 = start, 1 = end
+    
+    // Create sword blade with metallic gradient
+    effectElement.style.width = `${swordLength}px`;
+    effectElement.style.height = `${swordWidth}px`;
+    effectElement.style.background = `
+      linear-gradient(90deg, 
+        #c0c0c0 0%, 
+        #e8e8e8 15%, 
+        #ffffff 30%, 
+        #e8e8e8 50%, 
+        #c0c0c0 70%, 
+        #a0a0a0 85%, 
+        #808080 100%
+      )
+    `;
+    
+    // Add sword details
+    effectElement.style.border = "1px solid #606060";
+    effectElement.style.borderRadius = "2px";
+    effectElement.style.transformOrigin = "0% 50%"; // Rotate from left edge (character center)
+    
+    // Position sword to start from character center and extend outward in attack direction
+    effectElement.style.transform = `translate(0%, -50%) rotate(${angle}deg)`;
+    
+    // Dynamic opacity and effects based on animation progress
+    effectElement.style.opacity = alpha;
+    
+    // Add metallic shine effect that moves across the blade
+    const shineOffset = progress * swordLength;
+    effectElement.style.background = `
+      linear-gradient(90deg, 
+        #c0c0c0 0%, 
+        #e8e8e8 15%, 
+        #ffffff 30%, 
+        #e8e8e8 50%, 
+        #c0c0c0 70%, 
+        #a0a0a0 85%, 
+        #808080 100%
+      ),
+      linear-gradient(90deg, 
+        transparent 0%, 
+        transparent ${shineOffset - 20}px, 
+        rgba(255,255,255,0.8) ${shineOffset}px, 
+        rgba(255,255,255,0.4) ${shineOffset + 20}px, 
+        transparent ${shineOffset + 40}px, 
+        transparent 100%
+      )
+    `;
+    
+    // Add glow effect that intensifies at the start and fades
+    const glowIntensity = Math.sin(progress * Math.PI) * 0.8 + 0.2;
+    effectElement.style.boxShadow = `
+      0 0 ${15 * glowIntensity}px rgba(128,128,128,${glowIntensity * 0.6}),
+      0 0 ${8 * glowIntensity}px rgba(255,255,255,${glowIntensity * 0.4}),
+      inset 0 0 ${swordWidth * 0.3}px rgba(255,255,255,0.1)
+    `;
+    
+    // Add motion blur effect for faster slashes
+    if (progress < 0.3) {
+      effectElement.style.filter = `blur(${1 - progress * 3}px)`;
+    } else {
+      effectElement.style.filter = "blur(0px)";
+    }
+    
+    // Add sword hilt (handle) effect at the center
+    if (!effectElement.querySelector(".sword-hilt")) {
+      const hilt = document.createElement("div");
+      hilt.className = "sword-hilt";
+      hilt.style.position = "absolute";
+      hilt.style.left = "25%";
+      hilt.style.top = "50%";
+      hilt.style.width = "16px";
+      hilt.style.height = "16px";
+      hilt.style.background = "linear-gradient(45deg, #8B4513, #A0522D, #8B4513)";
+      hilt.style.border = "1px solid #654321";
+      hilt.style.borderRadius = "50%";
+      hilt.style.transform = "translate(-50%, -50%)";
+      hilt.style.boxShadow = "inset 0 0 4px rgba(0,0,0,0.5)";
+      effectElement.appendChild(hilt);
+    }
+    
+    // Add sword guard (crossguard) effect perpendicular to the blade
+    if (!effectElement.querySelector(".sword-guard")) {
+      const guard = document.createElement("div");
+      guard.className = "sword-guard";
+      guard.style.position = "absolute";
+      guard.style.left = "25%";
+      guard.style.top = "50%";
+      guard.style.width = "24px";
+      guard.style.height = "4px";
+      guard.style.background = "linear-gradient(90deg, #B8860B, #DAA520, #B8860B)";
+      guard.style.border = "1px solid #8B6914";
+      guard.style.borderRadius = "2px";
+      guard.style.transform = "translate(-50%, -50%) rotate(90deg)";
+      guard.style.boxShadow = "inset 0 0 2px rgba(0,0,0,0.3)";
+      effectElement.appendChild(guard);
+    }
+    
+    // Add trail effect for faster slashes
+    if (progress < 0.5) {
+      const trailOpacity = (0.5 - progress) * 2;
+      effectElement.style.boxShadow += `, 0 0 ${20 * trailOpacity}px rgba(128,128,128,${trailOpacity * 0.3})`;
+    }
+    
+    // Add particle effects for enhanced visual impact
+    if (progress < 0.2 && !effectElement.querySelector(".sword-particles")) {
+      const particlesContainer = document.createElement("div");
+      particlesContainer.className = "sword-particles";
+      particlesContainer.style.position = "absolute";
+      particlesContainer.style.left = "0";
+      particlesContainer.style.top = "0";
+      particlesContainer.style.width = "100%";
+      particlesContainer.style.height = "100%";
+      particlesContainer.style.pointerEvents = "none";
+      
+      // Create multiple particles with varied properties
+      for (let i = 0; i < 12; i++) {
+        const particle = document.createElement("div");
+        const size = 2 + Math.random() * 4;
+        const particleX = Math.random() * 100;
+        const particleY = Math.random() * 100;
+        
+        particle.style.position = "absolute";
+        particle.style.width = `${size}px`;
+        particle.style.height = `${size}px`;
+        particle.style.backgroundColor = i % 3 === 0 ? "#FFD700" : i % 3 === 1 ? "#FFA500" : "#FF6B35";
+        particle.style.borderRadius = "50%";
+        particle.style.left = `${particleX}%`;
+        particle.style.top = `${particleY}%`;
+        
+        // Set custom properties for varied particle movement
+        const moveX = (Math.random() - 0.5) * 60;
+        const moveY = (Math.random() - 0.5) * 60;
+        particle.style.setProperty('--particle-x', `${moveX}px`);
+        particle.style.setProperty('--particle-y', `${moveY}px`);
+        
+        // Varied animation timing and duration
+        const duration = 0.3 + Math.random() * 0.4;
+        const delay = Math.random() * 0.2;
+        particle.style.animation = `particleFloat ${duration}s ease-out ${delay}s forwards`;
+        
+        particlesContainer.appendChild(particle);
+      }
+      
+      effectElement.appendChild(particlesContainer);
+    }
+    
+    // Add screen shake effect for powerful attacks
+    if (effect.slashIntensity > 1.2 && progress < 0.3) {
+      const shakeIntensity = (effect.slashIntensity - 1.0) * 2;
+      const shakeX = (Math.random() - 0.5) * shakeIntensity;
+      const shakeY = (Math.random() - 0.5) * shakeIntensity;
+      effectElement.style.transform += ` translate(${shakeX}px, ${shakeY}px)`;
+    }
+  }
+
+  renderSlamEffect(effectElement, effect) {
+    // Create a powerful ground slam visual effect
+    const radius = effect.radius || 100;
+    const alpha = effect.lifetime / effect.maxLifetime;
+
+    // Create expanding shockwave effect
+    const currentRadius = radius * (1 - alpha); // Starts small, expands outward
+
+    effectElement.style.width = `${currentRadius * 2}px`;
+    effectElement.style.height = `${currentRadius * 2}px`;
+    effectElement.style.background = `radial-gradient(circle, rgba(255,165,0,${
+      alpha * 0.8
+    }) 0%, rgba(255,69,0,${alpha * 0.6}) 40%, rgba(139,69,19,${
+      alpha * 0.3
+    }) 80%, transparent 100%)`;
+    effectElement.style.borderRadius = "50%";
+    effectElement.style.border = `3px solid rgba(255,140,0,${alpha})`;
+    effectElement.style.boxShadow = `0 0 ${
+      20 + currentRadius * 0.2
+    }px rgba(255,140,0,${alpha * 0.7})`;
+    effectElement.style.transform = `translate(-50%, -50%)`;
+  }
+
+  renderWallHitEffect(effectElement, effect) {
+    const radius = effect.radius;
+    const alpha = effect.lifetime / effect.maxLifetime;
+
+    effectElement.style.width = `${radius * 2}px`;
+    effectElement.style.height = `${radius * 2}px`;
+    effectElement.style.backgroundColor = "#8b4513"; // Brown color for wall hits
+    effectElement.style.borderRadius = "50%";
+    effectElement.style.opacity = alpha;
+    effectElement.style.border = `2px solid #654321`;
+    effectElement.style.boxShadow = `0 0 ${radius}px rgba(139, 69, 19, 0.6)`;
+
+    // Add some debris effect
+    if (!effectElement.querySelector(".debris")) {
+      const debris = document.createElement("div");
+      debris.className = "debris";
+      debris.style.position = "absolute";
+      debris.style.width = "4px";
+      debris.style.height = "4px";
+      debris.style.backgroundColor = "#654321";
+      debris.style.borderRadius = "50%";
+      debris.style.left = "50%";
+      debris.style.top = "50%";
+      debris.style.transform = "translate(-50%, -50%)";
+      effectElement.appendChild(debris);
+    }
+  }
+
+  renderUI(gameEngine) {
+    // Update game timer - show remaining time as countdown
+    const timerElement = document.getElementById("gameTimer");
+    
+    if (timerElement) {
+      const remainingTime = gameEngine.getGameTimeRemaining();
+      const elapsedTime = gameEngine.getGameTime();
+      const formattedTime = gameEngine.formatTime(remainingTime);
+      
+      // Fallback: if countdown shows 5:00 (full time), show elapsed time instead
+      if (remainingTime >= gameEngine.gameDuration - 1000) { // Within 1 second of full time
+        timerElement.textContent = gameEngine.formatTime(elapsedTime);
+        timerElement.title = "Elapsed time (countdown not working)";
+      } else {
+        timerElement.textContent = formattedTime;
+        timerElement.title = "Time remaining";
+      }
+      
+      // Add visual feedback when time is running low (last 30 seconds)
+      if (remainingTime <= 30000) { // 30 seconds
+        timerElement.style.color = "#ff4757"; // Red color
+        timerElement.style.fontWeight = "bold";
+      } else {
+        timerElement.style.color = "#ffffff"; // White color
+        timerElement.style.fontWeight = "normal";
+      }
+    }
+
+    // Update FPS counter
+    const fpsElement = document.getElementById("fpsCounter");
+    if (fpsElement) {
+      fpsElement.textContent = `FPS: ${gameEngine.fps}`;
+    }
+
+    // Ability HUD (right-click class ability cooldown)
+    // Ensure container exists
+    let abilityHud = document.getElementById("abilityHud");
+    if (!abilityHud) {
+      abilityHud = document.createElement("div");
+      abilityHud.id = "abilityHud";
+      abilityHud.style.position = "absolute";
+      abilityHud.style.left = "10px";
+      abilityHud.style.bottom = "10px";
+      abilityHud.style.padding = "8px 10px";
+      abilityHud.style.background = "rgba(0,0,0,0.4)";
+      abilityHud.style.color = "#fff";
+      abilityHud.style.borderRadius = "6px";
+      abilityHud.style.fontFamily = "sans-serif";
+      abilityHud.style.fontSize = "14px";
+      this.gameArea.appendChild(abilityHud);
+    }
+
+    const me = this.gameEngine?.players.get(this.gameEngine?.localPlayerId);
+    let rcName = "Right-Click";
+    let abilityIcon = "🔧";
+    if (me && me.className) {
+      switch (me.className) {
+        case "healer":
+          rcName = "Divine Heal";
+          abilityIcon = "✨";
+          break;
+        case "mage":
+          rcName = "Mystic Slow";
+          abilityIcon = "🌀";
+          break;
+        case "ranged":
+          rcName = "Piercing Shot";
+          abilityIcon = "🏹";
+          break;
+        case "melee":
+          rcName = "Ground Slam";
+          abilityIcon = "💥";
+          break;
+        default:
+          rcName = "Right-Click";
+          abilityIcon = "🔧";
+      }
+    }
+    // Determine remaining cooldown
+    let remainingMs = 0;
+    if (gameEngine.abilityCooldowns) {
+      const typesByClass = {
+        healer: "healer_heal",
+        mage: "mage_slow",
+        ranged: "penetrating_arrow",
+        melee: "melee_slam",
+      };
+      const t = me && me.className ? typesByClass[me.className] : null;
+      if (t && gameEngine.abilityCooldowns.has(t)) {
+        const availableAt = gameEngine.abilityCooldowns.get(t);
+        remainingMs = Math.max(0, availableAt - Date.now());
+      }
+    }
+    const remainingSec = Math.ceil(remainingMs / 1000);
+    const isReady = remainingMs <= 0;
+
+    // Enhanced visual styling
+    abilityHud.innerHTML = `
+      <div style="display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: ${
+        isReady ? "rgba(46, 213, 115, 0.9)" : "rgba(255, 71, 87, 0.9)"
+      }; border-radius: 8px; border: 2px solid ${
+      isReady ? "#2ed573" : "#ff4757"
+    }; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">
+        <span style="font-size: 18px;">${abilityIcon}</span>
+        <div style="display: flex; flex-direction: column; align-items: flex-start;">
+          <span style="font-weight: bold; font-size: 12px; color: white;">${rcName}</span>
+          <span style="font-size: 10px; color: ${
+            isReady ? "#ffffff" : "#ffcccc"
+          };">${isReady ? "READY" : `${remainingSec}s`}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  cleanupUnusedElements() {
+    // Remove DOM elements that are no longer needed
+    const keysToRemove = [];
+    this.gameObjects.forEach((element, key) => {
+      if (!element || !element.parentNode) {
+        keysToRemove.push(key);
+      }
+    });
+
+    keysToRemove.forEach((key) => {
+      this.gameObjects.delete(key);
+    });
+  }
+
+  destroy() {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+    }
+    this.clear();
+  }
+}
+
+// Sound Manager
+class SoundManager {
+  constructor() {
+    this.sounds = new Map();
+    this.muted = false;
+    this.volume = 0.5;
+    this.initSounds();
+  }
+
+  initSounds() {
+    // Initialize sound effects
+    this.sounds.set(
+      "shoot",
+      this.createSound(
+        "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT"
+      )
+    );
+    this.sounds.set(
+      "hit",
+      this.createSound(
+        "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT"
+      )
+    );
+    this.sounds.set(
+      "gameStart",
+      this.createSound(
+        "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT"
+      )
+    );
+    this.sounds.set(
+      "gameOver",
+      this.createSound(
+        "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT"
+      )
+    );
+    this.sounds.set(
+      "weaponSwitch",
+      this.createSound(
+        "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT"
+      )
+    );
+    this.sounds.set(
+      "reload",
+      this.createSound(
+        "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT"
+      )
+    );
+    this.sounds.set(
+      "ability",
+      this.createSound(
+        "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT"
+      )
+    );
+    this.sounds.set(
+      "pause",
+      this.createSound(
+        "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT"
+      )
+    );
+    this.sounds.set(
+      "resume",
+      this.createSound(
+        "data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhBSuBzvLZiTYIG2m98OScTgwOUarm7blmGgU7k9n1unEiBC13yO/eizEIHWq+8+OWT"
+      )
+    );
+  }
+
+  createSound(dataUrl) {
+    const audio = new Audio(dataUrl);
+    audio.volume = this.volume;
+    return audio;
+  }
+
+  playSound(soundName) {
+    if (this.muted) return;
+
+    const sound = this.sounds.get(soundName);
+    if (sound) {
+      sound.currentTime = 0;
+      sound.play().catch((e) => console.log("Sound play failed:", e));
+    }
+  }
+
+  setVolume(volume) {
+    this.volume = Math.max(0, Math.min(1, volume));
+    this.sounds.forEach((sound) => {
+      sound.volume = this.volume;
+    });
+  }
+
+  toggleMute() {
+    this.muted = !this.muted;
+    this.sounds.forEach((sound) => {
+      sound.muted = this.muted;
+    });
+  }
+}
+
+// Export for use in other modules
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { GameEngine, GameRenderer, SoundManager };
+}

@@ -1,0 +1,12 @@
+{
+  "editor.formatOnSave": false,
+  "editor.formatOnType": false,
+  "editor.formatOnPaste": false,
+  "editor.codeActionsOnSave": {},
+  "editor.defaultFormatter": null,
+  "javascript.format.enable": false,
+  "typescript.format.enable": false,
+  "cursor.autoApplyCodeActions": false,
+  "cursor.inlineEdit.autoFixSyntax": false,
+  "cursor.inlineEdit.autoFormat": false
+}
